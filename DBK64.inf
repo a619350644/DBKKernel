@@ -1,0 +1,79 @@
+;
+; yeshen64.inf
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+CatalogFile=yeshen64.cat
+DriverVer= ; TODO: set DriverVer in stampinf property pages
+
+[DestinationDirs]
+DefaultDestDir = 12
+yeshen64_Device_CoInstaller_CopyFiles = 11
+
+; ================= Class section =====================
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+yeshen64.sys  = 1,,
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll=1 ; make sure the number matches with SourceDisksNames
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName%=Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%yeshen64.DeviceDesc%=yeshen64_Device, Root\yeshen64 ; TODO: edit hw-id
+
+[yeshen64_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+yeshen64.sys
+
+;-------------- Service installation
+[yeshen64_Device.NT.Services]
+AddService = yeshen64,%SPSVCINST_ASSOCSERVICE%, yeshen64_Service_Inst
+
+; -------------- yeshen64 driver install sections
+[yeshen64_Service_Inst]
+DisplayName    = %yeshen64.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\yeshen64.sys
+
+;
+;--- yeshen64_Device Coinstaller installation ------
+;
+
+[yeshen64_Device.NT.CoInstallers]
+AddReg=yeshen64_Device_CoInstaller_AddReg
+CopyFiles=yeshen64_Device_CoInstaller_CopyFiles
+
+[yeshen64_Device_CoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000, "WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll,WdfCoInstaller"
+
+[yeshen64_Device_CoInstaller_CopyFiles]
+WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll
+
+[yeshen64_Device.NT.Wdf]
+KmdfService =  yeshen64, yeshen64_wdfsect
+[yeshen64_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE= 0x00000002
+ManufacturerName="hello Engine" ;TODO: Replace with your manufacturer name
+ClassName="System" ; TODO: edit ClassName
+DiskName = "yeshen64 Installation Disk"
+yeshen64.DeviceDesc = "yeshen64 Device"
+yeshen64.SVCDESC = "yeshen64 Service"
