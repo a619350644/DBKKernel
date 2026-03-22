@@ -1,21 +1,16 @@
-/**
+﻿/**
  * @file HvMemBridge.c
  * @brief CE 驱动内存读写的 Hypervisor 桥接实现
  *
  * 将 CE dbk64 驱动的内存读写替换为 SvmDebug Hypervisor 的 CPUID 超级调用。
- * 原始方式: KeAttachProcess + RtlCopyMemory (ACE 可检测)
+ * 原始方式: KeAttachProcess + RtlCopyMemory (反作弊可检测)
  * 新方式:   CPUID hypercall → VMM 遍历页表 → 物理内存拷贝
- *
- * ACE 无法检测因为:
- *   - 无 KeAttachProcess (不切换到目标进程上下文)
- *   - 无 MmCopyVirtualMemory / NtRead/WriteVirtualMemory
- *   - 无 ObRegisterCallbacks 触发
- *   - VMM 运行在比 ACE 内核驱动更高的权限层
  */
 
 #include "HvMemBridge.h"
+#include <intrin.h>
 
-/* Guest ↔ VMM 通信的共享上下文页 */
+ /* Guest ↔ VMM 通信的共享上下文页 */
 static PHV_RW_CONTEXT g_BridgeContext = NULL;
 static ULONG64 g_BridgeContextPa = 0;
 static BOOLEAN g_BridgeInitialized = FALSE;
@@ -32,7 +27,7 @@ BOOLEAN HvBridge_IsHypervisorPresent(void)
     *(int*)(vendorId + 8) = regs[3];
     vendorId[12] = 0;
 
-        /* 必须匹配 SvmDebug 的厂商字符串 */ "VtDebugView "
+    /* 必须匹配 SvmDebug 的厂商字符串 */
     return (strcmp(vendorId, "VtDebugView ") == 0);
 }
 
@@ -46,7 +41,7 @@ NTSTATUS HvBridge_Init(void)
         return STATUS_SUCCESS;
     }
 
-        /* 先检查 Hypervisor 是否存在 */
+    /* 先检查 Hypervisor 是否存在 */
     if (!HvBridge_IsHypervisorPresent()) {
         DbgPrint("[HvBridge] SvmDebug hypervisor NOT detected!\n");
         return STATUS_NOT_FOUND;
@@ -54,7 +49,7 @@ NTSTATUS HvBridge_Init(void)
 
     DbgPrint("[HvBridge] SvmDebug hypervisor detected.\n");
 
-        /* 分配共享上下文页 (连续物理内存) */
+    /* 分配共享上下文页 (连续物理内存) */
     g_BridgeContext = (PHV_RW_CONTEXT)MmAllocateContiguousMemory(
         PAGE_SIZE, highAddr);
 
@@ -100,7 +95,7 @@ static ULONG64 GetProcessDirBase(DWORD PID, PEPROCESS PEProcess)
         }
     }
 
-        /* DirectoryTableBase 偏移, Win10 x64 所有版本均为 0x28 */
+    /* DirectoryTableBase 偏移, Win10 x64 所有版本均为 0x28 */
     ULONG64 cr3 = *(PULONG64)((PUCHAR)proc + 0x28);
 
     if (PEProcess == NULL) {
@@ -129,37 +124,29 @@ static BOOLEAN DoHypercallMemoryOp(
         return FALSE;
     }
 
-        /* 填充共享上下文 */
+    /* 填充共享上下文 */
     g_BridgeContext->TargetCr3 = TargetCr3;
     g_BridgeContext->SourceVa = TargetVa;
     g_BridgeContext->DestPa = bufferPa;
     g_BridgeContext->Size = Size;
     g_BridgeContext->IsWrite = IsWrite ? 1 : 0;
-    g_BridgeContext->Status = 1; // Pending
+    g_BridgeContext->Status = 1; /* Pending */
 
-        /* 内存屏障: 确保写入在超级调用前可见 */
+    /* 内存屏障: 确保写入在超级调用前可见 */
     KeMemoryBarrier();
 
-        /* 发起超级调用 */
-    int regs[4] = { 0 };
-    __cpuidex(regs, CPUID_HV_MEMORY_OP,
-        IsWrite ? HV_MEM_OP_WRITE : HV_MEM_OP_READ);
+    /* 发起超级调用 */
+    {
+        int regs[4] = { 0 };
+        __cpuidex(regs, CPUID_HV_MEMORY_OP,
+            IsWrite ? HV_MEM_OP_WRITE : HV_MEM_OP_READ);
+    }
 
     return (g_BridgeContext->Status == 0);
 }
 
 /**
  * @brief 读取进程内存 — CE ReadProcessMemory 的替代实现
- *
- * 原始实现: KeAttachProcess + RtlCopyMemory (ACE 可检测)
- * 新实现:   CPUID 超级调用 → VMM 物理内存拷贝 (ACE 不可见)
- *
- * @param PID        目标进程 PID
- * @param PEProcess  目标进程 EPROCESS (可为 NULL, 内部通过 PID 查找)
- * @param Address    目标进程中的虚拟地址
- * @param Size       读取字节数
- * @param Buffer     输出缓冲区
- * @return TRUE=成功, FALSE=失败
  */
 BOOLEAN HvBridge_ReadProcessMemory(
     DWORD PID,
@@ -168,30 +155,35 @@ BOOLEAN HvBridge_ReadProcessMemory(
     DWORD Size,
     PVOID Buffer)
 {
+    ULONG64 targetCr3;
+    PVOID kernelBuf;
+    DWORD bytesProcessed;
+    BOOLEAN success;
+
     if (Size == 0 || Buffer == NULL || Address == NULL) {
         return FALSE;
     }
 
-        /* Hypervisor 不可用时返回 FALSE, 调用者应使用原始方法 */
+    /* Hypervisor 不可用时返回 FALSE, 调用者应使用原始方法 */
     if (!g_BridgeInitialized) {
-        return FALSE; // Caller should use original ReadProcessMemory
+        return FALSE;
     }
 
-    ULONG64 targetCr3 = GetProcessDirBase(PID, PEProcess);
+    targetCr3 = GetProcessDirBase(PID, PEProcess);
     if (targetCr3 == 0) {
         return FALSE;
     }
 
-        /* 分配非分页内核缓冲区 (VMM 映射需要有效物理地址) */
-    PVOID kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
+    /* 分配非分页内核缓冲区 (VMM 映射需要有效物理地址) */
+    kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
     if (!kernelBuf) {
         return FALSE;
     }
     RtlZeroMemory(kernelBuf, Size);
 
-        /* 按页边界分块处理 */
-    DWORD bytesProcessed = 0;
-    BOOLEAN success = TRUE;
+    /* 按页边界分块处理 */
+    bytesProcessed = 0;
+    success = TRUE;
 
     while (bytesProcessed < Size)
     {
@@ -200,14 +192,13 @@ BOOLEAN HvBridge_ReadProcessMemory(
         if (chunkSize > pageRemain) chunkSize = pageRemain;
         if (chunkSize > PAGE_SIZE) chunkSize = PAGE_SIZE;
 
-        BOOLEAN ok = DoHypercallMemoryOp(
+        if (!DoHypercallMemoryOp(
             targetCr3,
             (ULONG64)Address + bytesProcessed,
             (PUCHAR)kernelBuf + bytesProcessed,
             chunkSize,
-            FALSE);
-
-        if (!ok) {
+            FALSE))
+        {
             success = FALSE;
             break;
         }
@@ -216,7 +207,7 @@ BOOLEAN HvBridge_ReadProcessMemory(
     }
 
     if (success) {
-                /* 从内核缓冲区拷贝到调用者缓冲区 */
+        /* 从内核缓冲区拷贝到调用者缓冲区 */
         __try {
             RtlCopyMemory(Buffer, kernelBuf, Size);
         }
@@ -231,7 +222,6 @@ BOOLEAN HvBridge_ReadProcessMemory(
 
 /**
  * @brief 写入进程内存 — CE WriteProcessMemory 的替代实现
- * @note 参数和返回值与 ReadProcessMemory 相同, 方向相反
  */
 BOOLEAN HvBridge_WriteProcessMemory(
     DWORD PID,
@@ -240,6 +230,11 @@ BOOLEAN HvBridge_WriteProcessMemory(
     DWORD Size,
     PVOID Buffer)
 {
+    ULONG64 targetCr3;
+    PVOID kernelBuf;
+    DWORD bytesProcessed;
+    BOOLEAN success;
+
     if (Size == 0 || Buffer == NULL || Address == NULL) {
         return FALSE;
     }
@@ -248,13 +243,13 @@ BOOLEAN HvBridge_WriteProcessMemory(
         return FALSE;
     }
 
-    ULONG64 targetCr3 = GetProcessDirBase(PID, PEProcess);
+    targetCr3 = GetProcessDirBase(PID, PEProcess);
     if (targetCr3 == 0) {
         return FALSE;
     }
 
-        /* 分配内核缓冲区并拷贝源数据 */
-    PVOID kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
+    /* 分配内核缓冲区并拷贝源数据 */
+    kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
     if (!kernelBuf) {
         return FALSE;
     }
@@ -267,9 +262,9 @@ BOOLEAN HvBridge_WriteProcessMemory(
         return FALSE;
     }
 
-        /* 按页边界分块处理 */
-    DWORD bytesProcessed = 0;
-    BOOLEAN success = TRUE;
+    /* 按页边界分块处理 */
+    bytesProcessed = 0;
+    success = TRUE;
 
     while (bytesProcessed < Size)
     {
@@ -278,14 +273,13 @@ BOOLEAN HvBridge_WriteProcessMemory(
         if (chunkSize > pageRemain) chunkSize = pageRemain;
         if (chunkSize > PAGE_SIZE) chunkSize = PAGE_SIZE;
 
-        BOOLEAN ok = DoHypercallMemoryOp(
+        if (!DoHypercallMemoryOp(
             targetCr3,
             (ULONG64)Address + bytesProcessed,
             (PUCHAR)kernelBuf + bytesProcessed,
             chunkSize,
-            TRUE);
-
-        if (!ok) {
+            TRUE))
+        {
             success = FALSE;
             break;
         }
@@ -295,4 +289,90 @@ BOOLEAN HvBridge_WriteProcessMemory(
 
     ExFreePoolWithTag(kernelBuf, 'HvBr');
     return success;
+}
+
+/**
+ * @brief 通过内核句柄查询虚拟内存区域 — 替代 KeAttachProcess + ZwQueryVirtualMemory
+ */
+BOOLEAN HvBridge_QueryVirtualMemory(
+    DWORD PID,
+    PEPROCESS PEProcess,
+    PVOID Address,
+    PVOID MemoryInfo,
+    SIZE_T InfoLength,
+    PUINT_PTR pRegionLength,
+    PUINT_PTR pBaseAddress)
+{
+    PEPROCESS proc = PEProcess;
+    NTSTATUS status;
+    BOOLEAN needDeref = FALSE;
+    HANDLE kernelHandle = NULL;
+    SIZE_T returnLength = 0;
+
+    /* MEMORY_BASIC_INFORMATION 内部定义, 避免与用户态头文件冲突 */
+    struct {
+        PVOID  BaseAddress;
+        PVOID  AllocationBase;
+        ULONG  AllocationProtect;
+        USHORT PartitionId;
+        USHORT Padding;
+        SIZE_T RegionSize;
+        ULONG  State;
+        ULONG  Protect;
+        ULONG  Type;
+    } mbi;
+
+    UNREFERENCED_PARAMETER(MemoryInfo);
+    UNREFERENCED_PARAMETER(InfoLength);
+
+    if (!pRegionLength || !pBaseAddress)
+        return FALSE;
+
+    *pRegionLength = 0;
+    *pBaseAddress = 0;
+
+    /* 获取 EPROCESS */
+    if (proc == NULL) {
+        status = PsLookupProcessByProcessId((PVOID)(UINT_PTR)PID, &proc);
+        if (!NT_SUCCESS(status) || proc == NULL)
+            return FALSE;
+        needDeref = TRUE;
+    }
+
+    /* 创建内核句柄 — 不触发 ObRegisterCallbacks */
+    status = ObOpenObjectByPointer(
+        proc,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_QUERY_INFORMATION,
+        *PsProcessType,
+        KernelMode,
+        &kernelHandle);
+
+    if (needDeref)
+        ObDereferenceObject(proc);
+
+    if (!NT_SUCCESS(status) || !kernelHandle)
+        return FALSE;
+
+    /* 使用内核句柄查询 — 不需要 KeAttachProcess */
+    RtlZeroMemory(&mbi, sizeof(mbi));
+
+    status = ZwQueryVirtualMemory(
+        kernelHandle,
+        Address,
+        0,  /* MemoryBasicInformation */
+        &mbi,
+        sizeof(mbi),
+        &returnLength);
+
+    ZwClose(kernelHandle);
+
+    if (!NT_SUCCESS(status))
+        return FALSE;
+
+    *pBaseAddress = (UINT_PTR)mbi.BaseAddress;
+    *pRegionLength = (UINT_PTR)mbi.RegionSize;
+
+    return TRUE;
 }
