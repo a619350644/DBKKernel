@@ -24,125 +24,132 @@
 #include "SvmBridge.h"  /* [NEW] SvmDebug bridge for handle elevation */
 
 /* ========================================================================
- * [FIX] 通过 SvmDebug 设备直接走 Hypervisor 物理内存拷贝
+ * [FIX] 通过 SvmDebug IOCTL 读写内存 — 零 KeStackAttachProcess
  *
- * 为什么之前的方案全部被检测:
- *   KeAttachProcess + RtlCopyMemory → 原始路径, 被检测
- *   MmCopyVirtualMemory(KernelMode) → 内部还是 KeStackAttachProcess, 被检测
- *   ZwReadVirtualMemory(kernelHandle) → 内部还是 MmCopyVirtualMemory → 被检测
- *
- * 所有 Windows API 读跨进程内存最终都走 KeStackAttachProcess, 无法避免。
- * 反作弊检测的是 KeStackAttachProcess 行为本身 (不管调用栈多干净)。
- *
- * 唯一解法: SvmDebug 的 IOCTL_HV_READ_MEMORY
- *   → CPUID 超级调用 → VMM 遍历物理页表 → PA 直接拷贝
- *   → 完全不触发 KeStackAttachProcess / MmCopyVirtualMemory / 任何内核 API
+ * 关键修复: BufferAddress 必须传有效内核地址!
+ * SvmDebug 的 HvReadProcessMemory 将结果写入 (PVOID)req->BufferAddress,
+ * 如果 BufferAddress=0 → Buffer=NULL → 函数返回 STATUS_INVALID_PARAMETER
+ * → IOCTL 失败 → 回退到原始 ReadProcessMemory → KeStackAttachProcess → 被检测
  * ======================================================================== */
 
- /* IOCTL 编码 — 必须与 SvmDebug 的 DrvMain.cpp 中一致 */
 #define SVM_IOCTL_HV_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define SVM_IOCTL_HV_WRITE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #pragma pack(push, 1)
 typedef struct _SVM_MEM_REQ {
-	UINT64 TargetPid;
-	UINT64 Address;
-	UINT64 Size;
-	UINT64 BufferAddress;
+    UINT64 TargetPid;
+    UINT64 Address;
+    UINT64 Size;
+    UINT64 BufferAddress;
 } SVM_MEM_REQ;
 #pragma pack(pop)
 
 static HANDLE  g_hSvmDev = NULL;
-static BOOLEAN g_SvmDevTried = FALSE;
+static BOOLEAN g_SvmDevOpened = FALSE;
 
 static BOOLEAN SvmEnsureDevice(void)
 {
-	UNICODE_STRING devName;
-	OBJECT_ATTRIBUTES oa;
-	IO_STATUS_BLOCK iosb;
-	NTSTATUS st;
+    UNICODE_STRING devName;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS st;
 
-	if (g_hSvmDev) return TRUE;
-	if (g_SvmDevTried) return FALSE;
-	g_SvmDevTried = TRUE;
+    if (g_hSvmDev) return TRUE;
+    if (g_SvmDevOpened) return FALSE; /* 之前尝试过且失败, 不再重试 */
 
-	RtlInitUnicodeString(&devName, L"\\Device\\SvmDebug");
-	InitializeObjectAttributes(&oa, &devName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    RtlInitUnicodeString(&devName, L"\\Device\\SvmDebug");
+    InitializeObjectAttributes(&oa, &devName, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-	st = ZwOpenFile(&g_hSvmDev, GENERIC_READ | GENERIC_WRITE,
-		&oa, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE, 0);
-	if (!NT_SUCCESS(st)) { g_hSvmDev = NULL; return FALSE; }
-	DbgPrint("[SVM-CE] SvmDebug device opened OK\n");
-	return TRUE;
+    st = ZwOpenFile(&g_hSvmDev, GENERIC_READ | GENERIC_WRITE,
+        &oa, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE, 0);
+    g_SvmDevOpened = TRUE;
+    if (!NT_SUCCESS(st)) {
+        g_hSvmDev = NULL;
+        DbgPrint("[SVM-CE] Failed to open SvmDebug device: 0x%X\n", st);
+        return FALSE;
+    }
+    DbgPrint("[SVM-CE] SvmDebug device opened OK\n");
+    return TRUE;
 }
 
-/* 通过 SvmDebug Hypervisor 读取目标进程内存 — 零 KeStackAttachProcess */
 static BOOLEAN SvmHvRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG size)
 {
-	IO_STATUS_BLOCK iosb;
-	SVM_MEM_REQ req = { pid, addr, (UINT64)size, 0 };
-	NTSTATUS st;
+    IO_STATUS_BLOCK iosb;
+    SVM_MEM_REQ req;
+    NTSTATUS st;
+    PVOID kbuf;
 
-	if (!SvmEnsureDevice()) return FALSE;
+    if (!SvmEnsureDevice() || size == 0) return FALSE;
 
-	st = ZwDeviceIoControlFile(g_hSvmDev, NULL, NULL, NULL, &iosb,
-		SVM_IOCTL_HV_READ, &req, sizeof(req), outBuf, size);
-	return NT_SUCCESS(st);
+    /* 分配内核缓冲区 — HvReadProcessMemory 会将结果写入此地址 */
+    kbuf = ExAllocatePoolWithTag(NonPagedPool, size, 'SvRd');
+    if (!kbuf) return FALSE;
+    RtlZeroMemory(kbuf, size);
+
+    /* 关键: BufferAddress = 内核缓冲区地址 (不是0!) */
+    req.TargetPid = pid;
+    req.Address = addr;
+    req.Size = (UINT64)size;
+    req.BufferAddress = (UINT64)kbuf;
+
+    st = ZwDeviceIoControlFile(g_hSvmDev, NULL, NULL, NULL, &iosb,
+        SVM_IOCTL_HV_READ, &req, sizeof(req), NULL, 0);
+
+    if (NT_SUCCESS(st))
+        RtlCopyMemory(outBuf, kbuf, size);
+
+    ExFreePoolWithTag(kbuf, 'SvRd');
+    return NT_SUCCESS(st);
 }
 
-/* 通过 SvmDebug Hypervisor 写入目标进程内存 */
 static BOOLEAN SvmHvWrite(UINT64 pid, UINT64 addr, PVOID data, ULONG size)
 {
-	IO_STATUS_BLOCK iosb;
-	PUCHAR buf;
-	SVM_MEM_REQ* pReq;
-	ULONG totalIn;
-	NTSTATUS st;
+    IO_STATUS_BLOCK iosb;
+    SVM_MEM_REQ req;
+    NTSTATUS st;
+    PVOID kbuf;
 
-	if (!SvmEnsureDevice()) return FALSE;
+    if (!SvmEnsureDevice() || size == 0) return FALSE;
 
-	/* SvmDebug WRITE IOCTL 输入: [SVM_MEM_REQ][待写数据] */
-	totalIn = sizeof(SVM_MEM_REQ) + size;
-	buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, totalIn, 'SvWr');
-	if (!buf) return FALSE;
+    /* 分配内核缓冲区并拷贝待写数据 */
+    kbuf = ExAllocatePoolWithTag(NonPagedPool, size, 'SvWr');
+    if (!kbuf) return FALSE;
+    RtlCopyMemory(kbuf, data, size);
 
-	pReq = (SVM_MEM_REQ*)buf;
-	pReq->TargetPid = pid;
-	pReq->Address = addr;
-	pReq->Size = (UINT64)size;
-	pReq->BufferAddress = 0;
-	RtlCopyMemory(buf + sizeof(SVM_MEM_REQ), data, size);
+    req.TargetPid = pid;
+    req.Address = addr;
+    req.Size = (UINT64)size;
+    req.BufferAddress = (UINT64)kbuf; /* HvWriteProcessMemory 从此地址读取数据 */
 
-	st = ZwDeviceIoControlFile(g_hSvmDev, NULL, NULL, NULL, &iosb,
-		SVM_IOCTL_HV_WRITE, buf, totalIn, NULL, 0);
+    st = ZwDeviceIoControlFile(g_hSvmDev, NULL, NULL, NULL, &iosb,
+        SVM_IOCTL_HV_WRITE, &req, sizeof(req), NULL, 0);
 
-	ExFreePoolWithTag(buf, 'SvWr');
-	return NT_SUCCESS(st);
+    ExFreePoolWithTag(kbuf, 'SvWr');
+    return NT_SUCCESS(st);
 }
 
-/* ZwQueryVirtualMemory 动态解析 (用于 QUERY_VM) */
+/* ZwQueryVirtualMemory 动态解析 */
 typedef NTSTATUS(NTAPI* FnZwQVM)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
 static FnZwQVM g_pZwQVM = NULL;
 static BOOLEAN g_ZwQResolved = FALSE;
 static void ResolveZwQVM(void) {
-	UNICODE_STRING n;
-	if (g_ZwQResolved) return;
-	RtlInitUnicodeString(&n, L"ZwQueryVirtualMemory");
-	g_pZwQVM = (FnZwQVM)MmGetSystemRoutineAddress(&n);
-	g_ZwQResolved = TRUE;
+    UNICODE_STRING n;
+    if (g_ZwQResolved) return;
+    RtlInitUnicodeString(&n, L"ZwQueryVirtualMemory");
+    g_pZwQVM = (FnZwQVM)MmGetSystemRoutineAddress(&n);
+    g_ZwQResolved = TRUE;
 }
 
-/* 辅助: 创建内核句柄 */
 static HANDLE SvmKernelHandle(UINT64 pid, ACCESS_MASK access)
 {
-	PEPROCESS proc = NULL;
-	HANDLE kh = NULL;
-	NTSTATUS st = PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc);
-	if (!NT_SUCCESS(st) || !proc) return NULL;
-	st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
-		access, *PsProcessType, KernelMode, &kh);
-	ObDereferenceObject(proc);
-	return NT_SUCCESS(st) ? kh : NULL;
+    PEPROCESS proc = NULL;
+    HANDLE kh = NULL;
+    NTSTATUS st = PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc);
+    if (!NT_SUCCESS(st) || !proc) return NULL;
+    st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
+        access, *PsProcessType, KernelMode, &kh);
+    ObDereferenceObject(proc);
+    return NT_SUCCESS(st) ? kh : NULL;
 }
 
 
@@ -472,11 +479,13 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 			pinp = Irp->AssociatedIrp.SystemBuffer;
 
-			/* [FIX] SVM 活跃时: 通过 SvmDebug Hypervisor 读取 (零 KeStackAttachProcess) */
-			if (SvmBridge_IsActive() &&
-				SvmHvRead(pinp->processid, pinp->startaddress, pinp, pinp->bytestoread))
+			/* [FIX] SVM 活跃时通过 SvmDebug Hypervisor 读取 (零 KeStackAttachProcess)
+			 * SvmHvRead 内部: 分配内核缓冲区 → 设置 BufferAddress → IOCTL → 拷贝结果
+			 * 不回退到原始路径! 回退 = KeStackAttachProcess = 被检测 */
+			if (SvmBridge_IsActive())
 			{
-				ntStatus = STATUS_SUCCESS;
+				ntStatus = SvmHvRead(pinp->processid, pinp->startaddress,
+					pinp, pinp->bytestoread) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 			}
 			else
 			{
@@ -504,12 +513,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			DbgPrint("sizeof(inp)=%d\n", sizeof(inp));
 			pinp = Irp->AssociatedIrp.SystemBuffer;
 
-			/* [FIX] SVM 活跃时: 通过 SvmDebug Hypervisor 写入 */
-			if (SvmBridge_IsActive() &&
-				SvmHvWrite(pinp->processid, pinp->startaddress,
-					(PVOID)((UINT_PTR)pinp + sizeof(inp)), pinp->bytestowrite))
+			/* [FIX] SVM 活跃时通过 SvmDebug Hypervisor 写入 */
+			if (SvmBridge_IsActive())
 			{
-				ntStatus = STATUS_SUCCESS;
+				ntStatus = SvmHvWrite(pinp->processid, pinp->startaddress,
+					(PVOID)((UINT_PTR)pinp + sizeof(inp)),
+					pinp->bytestowrite) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 			}
 			else
 			{
@@ -721,8 +730,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		__try
 		{
 			/* [FIX] SVM 活跃时: 内核句柄 + ZwQueryVirtualMemory
-			 * GetMemoryRegionData 内部用 KeAttachProcess → 被检测
-			 * 改用内核句柄直接查询 → 无进程上下文切换 */
+			 * GetMemoryRegionData 内部用 KeAttachProcess → 被检测 */
 			ResolveZwQVM();
 			if (SvmBridge_IsActive() && g_pZwQVM)
 			{
@@ -732,23 +740,19 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					BYTE mbi[48];
 					SIZE_T retLen = 0;
 					RtlZeroMemory(mbi, sizeof(mbi));
-
 					ntStatus = g_pZwQVM(kh,
 						(PVOID)(UINT_PTR)(PInputBuf->StartAddress),
 						0, mbi, sizeof(mbi), &retLen);
 					ZwClose(kh);
-
 					if (NT_SUCCESS(ntStatus))
 					{
-						BaseAddress = *(UINT_PTR*)(mbi + 0x00);
-						length = *(UINT_PTR*)(mbi + 0x18);
+						BaseAddress            = *(UINT_PTR*)(mbi + 0x00);
+						length                 = *(UINT_PTR*)(mbi + 0x18);
 						POutputBuf->protection = *(DWORD*)(mbi + 0x24);
 					}
 				}
 				else
-				{
 					ntStatus = GetMemoryRegionData((DWORD)PInputBuf->ProcessID, NULL, (PVOID)(UINT_PTR)(PInputBuf->StartAddress), &(POutputBuf->protection), &length, &BaseAddress);
-				}
 			}
 			else
 			{
