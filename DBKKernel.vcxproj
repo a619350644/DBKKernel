@@ -335,6 +335,7 @@ makecab /f "$(ProjectDir)\dbk64.ddf"
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release without sig|Win32'">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="StealthScan.c" />
     <ClCompile Include="threads.c" />
     <ClCompile Include="ultimap.c" />
     <ClCompile Include="ultimap2.c" />
@@ -359,6 +360,7 @@ makecab /f "$(ProjectDir)\dbk64.ddf"
     <ClInclude Include="noexceptions.h" />
     <ClInclude Include="processlist.h" />
     <ClInclude Include="sigcheck.h" />
+    <ClInclude Include="StealthScan.h" />
     <ClInclude Include="tdiwrapper.h" />
     <ClInclude Include="threads.h" />
     <ClInclude Include="ultimap.h" />

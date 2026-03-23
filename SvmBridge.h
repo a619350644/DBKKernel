@@ -94,6 +94,27 @@ typedef struct _SVM_SW_BP_REQUEST {
 #define IOCTL_CE_SVM_UNELEVATE_PID   SVM_CTL(0x909)  /* 输入: ULONG64 targetPid */
 
 /* ================================================================
+ * SvmDebug HvMemory IOCTL (直接转发, 不经 CE 自定义 IOCTL)
+ * ================================================================ */
+#define IOCTL_HV_QUERY_VM  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* HvQueryVirtualMemory 请求/响应结构体 (必须与 SvmDebug HvMemory.h 一致) */
+#pragma pack(push, 1)
+typedef struct _SVMBRIDGE_QVM_REQ {
+    UINT64 TargetPid;
+    UINT64 StartAddress;
+} SVMBRIDGE_QVM_REQ;
+
+typedef struct _SVMBRIDGE_QVM_RESP {
+    UINT64 BaseAddress;
+    UINT64 RegionSize;
+    ULONG  Protection;
+    ULONG  State;
+    ULONG  Type;
+} SVMBRIDGE_QVM_RESP;
+#pragma pack(pop)
+
+/* ================================================================
  * Public API
  * ================================================================ */
 
@@ -159,6 +180,20 @@ NTSTATUS SvmBridge_ElevatePid(ULONG64 targetPid);
  * [NEW] 移除目标进程的句柄升权。
  */
 NTSTATUS SvmBridge_UnelevatePid(ULONG64 targetPid);
+
+/**
+ * [NEW] 通过 SvmDebug 调用真正的 ZwQueryVirtualMemory。
+ * 调用来自 SvmDebug 上下文, ACE 看不到 CE 的 KeStackAttachProcess。
+ * @return STATUS_SUCCESS 成功, 其他失败
+ */
+NTSTATUS SvmBridge_QueryVirtualMemory(
+    UINT64   TargetPid,
+    UINT64   StartAddress,
+    PUINT64  OutBaseAddress,
+    PUINT64  OutRegionSize,
+    PULONG   OutProtection,
+    PULONG   OutState,
+    PULONG   OutType);
 
 /**
  * 分发 CE 自定义 IOCTL (0x900 系列)。

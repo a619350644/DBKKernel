@@ -119,6 +119,11 @@ static BOOLEAN DoHypercallMemoryOp(
         return FALSE;
     }
 
+    /* VMM 限制: HvHandleMemoryOp 拒绝 > 1MB 的请求 */
+    if (Size == 0 || Size > 0x100000) {
+        return FALSE;
+    }
+
     ULONG64 bufferPa = MmGetPhysicalAddress(KernelBuffer).QuadPart;
     if (bufferPa == 0) {
         return FALSE;
@@ -147,6 +152,13 @@ static BOOLEAN DoHypercallMemoryOp(
 
 /**
  * @brief 读取进程内存 — CE ReadProcessMemory 的替代实现
+ *
+ * [v18] 一次 CPUID 超级调用处理整个请求, VMM 内部逐页循环
+ * 旧方案: N 页 = N 次 CPUID VMEXIT
+ * 新方案: N 页 = 1 次 CPUID VMEXIT (VMM HvHandleMemoryOp 内部循环)
+ *
+ * 关键: 使用 MmAllocateContiguousMemory 保证物理连续
+ * VMM 侧 PhysicalMemoryCopy_Vmm 用 bpa+offset 寻址, 要求缓冲区物理连续
  */
 BOOLEAN HvBridge_ReadProcessMemory(
     DWORD PID,
@@ -157,14 +169,13 @@ BOOLEAN HvBridge_ReadProcessMemory(
 {
     ULONG64 targetCr3;
     PVOID kernelBuf;
-    DWORD bytesProcessed;
     BOOLEAN success;
+    PHYSICAL_ADDRESS highAddr;
 
     if (Size == 0 || Buffer == NULL || Address == NULL) {
         return FALSE;
     }
 
-    /* Hypervisor 不可用时返回 FALSE, 调用者应使用原始方法 */
     if (!g_BridgeInitialized) {
         return FALSE;
     }
@@ -174,40 +185,18 @@ BOOLEAN HvBridge_ReadProcessMemory(
         return FALSE;
     }
 
-    /* 分配非分页内核缓冲区 (VMM 映射需要有效物理地址) */
-    kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
+    /* 物理连续缓冲区 — VMM 用 PA+offset 寻址, 必须连续 */
+    highAddr.QuadPart = ~0ULL;
+    kernelBuf = MmAllocateContiguousMemory(Size, highAddr);
     if (!kernelBuf) {
         return FALSE;
     }
     RtlZeroMemory(kernelBuf, Size);
 
-    /* 按页边界分块处理 */
-    bytesProcessed = 0;
-    success = TRUE;
-
-    while (bytesProcessed < Size)
-    {
-        DWORD pageRemain = PAGE_SIZE - (DWORD)(((ULONG64)Address + bytesProcessed) & 0xFFF);
-        DWORD chunkSize = Size - bytesProcessed;
-        if (chunkSize > pageRemain) chunkSize = pageRemain;
-        if (chunkSize > PAGE_SIZE) chunkSize = PAGE_SIZE;
-
-        if (!DoHypercallMemoryOp(
-            targetCr3,
-            (ULONG64)Address + bytesProcessed,
-            (PUCHAR)kernelBuf + bytesProcessed,
-            chunkSize,
-            FALSE))
-        {
-            success = FALSE;
-            break;
-        }
-
-        bytesProcessed += chunkSize;
-    }
+    /* 一次超级调用处理整个请求 — VMM 内部逐页翻译+拷贝 */
+    success = DoHypercallMemoryOp(targetCr3, (ULONG64)Address, kernelBuf, Size, FALSE);
 
     if (success) {
-        /* 从内核缓冲区拷贝到调用者缓冲区 */
         __try {
             RtlCopyMemory(Buffer, kernelBuf, Size);
         }
@@ -216,12 +205,14 @@ BOOLEAN HvBridge_ReadProcessMemory(
         }
     }
 
-    ExFreePoolWithTag(kernelBuf, 'HvBr');
+    MmFreeContiguousMemory(kernelBuf);
     return success;
 }
 
 /**
  * @brief 写入进程内存 — CE WriteProcessMemory 的替代实现
+ *
+ * [v18] 一次 CPUID 超级调用处理整个写入请求
  */
 BOOLEAN HvBridge_WriteProcessMemory(
     DWORD PID,
@@ -232,8 +223,8 @@ BOOLEAN HvBridge_WriteProcessMemory(
 {
     ULONG64 targetCr3;
     PVOID kernelBuf;
-    DWORD bytesProcessed;
     BOOLEAN success;
+    PHYSICAL_ADDRESS highAddr;
 
     if (Size == 0 || Buffer == NULL || Address == NULL) {
         return FALSE;
@@ -248,8 +239,9 @@ BOOLEAN HvBridge_WriteProcessMemory(
         return FALSE;
     }
 
-    /* 分配内核缓冲区并拷贝源数据 */
-    kernelBuf = ExAllocatePoolWithTag(NonPagedPool, Size, 'HvBr');
+    /* 物理连续缓冲区 — VMM 用 PA+offset 寻址, 必须连续 */
+    highAddr.QuadPart = ~0ULL;
+    kernelBuf = MmAllocateContiguousMemory(Size, highAddr);
     if (!kernelBuf) {
         return FALSE;
     }
@@ -258,36 +250,14 @@ BOOLEAN HvBridge_WriteProcessMemory(
         RtlCopyMemory(kernelBuf, Buffer, Size);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        ExFreePoolWithTag(kernelBuf, 'HvBr');
+        MmFreeContiguousMemory(kernelBuf);
         return FALSE;
     }
 
-    /* 按页边界分块处理 */
-    bytesProcessed = 0;
-    success = TRUE;
+    /* 一次超级调用处理整个写入请求 — VMM 内部逐页翻译+拷贝 */
+    success = DoHypercallMemoryOp(targetCr3, (ULONG64)Address, kernelBuf, Size, TRUE);
 
-    while (bytesProcessed < Size)
-    {
-        DWORD pageRemain = PAGE_SIZE - (DWORD)(((ULONG64)Address + bytesProcessed) & 0xFFF);
-        DWORD chunkSize = Size - bytesProcessed;
-        if (chunkSize > pageRemain) chunkSize = pageRemain;
-        if (chunkSize > PAGE_SIZE) chunkSize = PAGE_SIZE;
-
-        if (!DoHypercallMemoryOp(
-            targetCr3,
-            (ULONG64)Address + bytesProcessed,
-            (PUCHAR)kernelBuf + bytesProcessed,
-            chunkSize,
-            TRUE))
-        {
-            success = FALSE;
-            break;
-        }
-
-        bytesProcessed += chunkSize;
-    }
-
-    ExFreePoolWithTag(kernelBuf, 'HvBr');
+    MmFreeContiguousMemory(kernelBuf);
     return success;
 }
 

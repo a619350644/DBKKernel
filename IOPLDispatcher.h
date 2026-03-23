@@ -123,6 +123,10 @@ extern PVOID DRMHandle;
 #define SYSTEMSERVICE(_function)		KeServiceDescriptorTable->ServiceTable[ *(PULONG)((PUCHAR)_function+1)]
 #define SYSTEMSERVICELINK(_function)	KeServiceDescriptorTable->ServiceTable[*((PUCHAR)(*(PULONG)*((PULONG)((PUCHAR)_function+2)))+1)]
 
+NTKERNELAPI PVOID PsGetProcessPeb(PEPROCESS);
+
+void StealthInit(void);
+void StealthCleanup(void);
 
 NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp);
 BOOL DispatchIoctlDBVM(IN PDEVICE_OBJECT DeviceObject, ULONG IoControlCode, PVOID lpInBuffer, DWORD nInBufferSize, PVOID lpOutBuffer, DWORD nOutBufferSize, PDWORD lpBytesReturned);

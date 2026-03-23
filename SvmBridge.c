@@ -334,6 +334,49 @@ NTSTATUS SvmBridge_UnelevatePid(ULONG64 targetPid)
 }
 
 /* ================================================================
+ * [NEW] 通过 SvmDebug 调用真正的 ZwQueryVirtualMemory
+ *
+ * CE -> dbk64 -> SvmBridge -> SvmDebug (IOCTL_HV_QUERY_VM)
+ *   -> ZwQueryVirtualMemory(KernelMode, OBJ_KERNEL_HANDLE)
+ *
+ * ACE 视角: KeStackAttachProcess 的调用栈来自 SvmDebug, 不是 CE 驱动
+ * ================================================================ */
+NTSTATUS SvmBridge_QueryVirtualMemory(
+    UINT64   TargetPid,
+    UINT64   StartAddress,
+    PUINT64  OutBaseAddress,
+    PUINT64  OutRegionSize,
+    PULONG   OutProtection,
+    PULONG   OutState,
+    PULONG   OutType)
+{
+    SVMBRIDGE_QVM_REQ req = { 0 };
+    SVMBRIDGE_QVM_RESP resp = { 0 };
+    NTSTATUS status;
+
+    if (!g_SvmActive)
+        return STATUS_DEVICE_NOT_READY;
+
+    req.TargetPid = TargetPid;
+    req.StartAddress = StartAddress;
+
+    status = SvmBridge_SendIoctl(
+        IOCTL_HV_QUERY_VM,
+        &req, sizeof(req),
+        &resp, sizeof(resp));
+
+    if (NT_SUCCESS(status)) {
+        if (OutBaseAddress) *OutBaseAddress = resp.BaseAddress;
+        if (OutRegionSize)  *OutRegionSize  = resp.RegionSize;
+        if (OutProtection)  *OutProtection  = resp.Protection;
+        if (OutState)       *OutState       = resp.State;
+        if (OutType)        *OutType        = resp.Type;
+    }
+
+    return status;
+}
+
+/* ================================================================
  * 公开接口: 分发 CE 自定义 IOCTL (0x900 系列)
  *
  * 如果不是桥接 IOCTL, 返回 STATUS_INVALID_DEVICE_REQUEST,

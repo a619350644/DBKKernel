@@ -79,6 +79,9 @@
     <ClCompile Include="HvMemBridge.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="StealthScan.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cetc.h">
@@ -148,6 +151,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HvMemBridge.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="StealthScan.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

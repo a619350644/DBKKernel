@@ -22,6 +22,7 @@
 #include "ultimap2\apic.h"
 
 #include "SvmBridge.h"  /* SvmDebug kernel-to-kernel bridge */
+#include "StealthScan.h" /* 隐身扫描引擎 */
 
 
 #if (AMD64 && TOBESIGNED)
@@ -194,6 +195,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
 	KernelWritesIgnoreWP = 0;
 
 	DbgPrint("[DBK-SVM] DriverEntry ENTERED (SvmBridge build v1)\n");
+	StealthInit();
 
 
 
@@ -617,6 +619,7 @@ NTSTATUS DispatchClose(IN PDEVICE_OBJECT DeviceObject,
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
 	DbgPrint("[DBK-SVM] UnloadDriver called, cleaning up SvmBridge...\n");
+	StealthCleanup();
 	SvmBridge_Cleanup();
 
 	cleanupDBVM();
