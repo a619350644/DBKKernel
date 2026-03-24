@@ -1,4 +1,4 @@
-#pragma warning( disable: 4100 4101 4103 4189)
+﻿#pragma warning( disable: 4100 4101 4103 4189)
 
 #include "DBKFunc.h"
 #include <ntifs.h>
@@ -21,7 +21,10 @@
 
 #include "ultimap2\apic.h"
 
-#include "SvmBridge.h"  /* SvmDebug kernel-to-kernel bridge */
+#include "SvmBridge.h"
+
+extern NTSTATUS HvBatchRead_Init(void);
+extern void HvBatchRead_Cleanup(void);  /* SvmDebug kernel-to-kernel bridge */
 #include "StealthScan.h" /* 隐身扫描引擎 */
 
 
@@ -547,6 +550,9 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
 			svmStatus, SvmBridge_IsActive());
 	}
 
+	/* [NEW] 初始化批量散射读取 */
+	HvBatchRead_Init();
+
 	return STATUS_SUCCESS;
 }
 
@@ -619,6 +625,10 @@ NTSTATUS DispatchClose(IN PDEVICE_OBJECT DeviceObject,
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
 	DbgPrint("[DBK-SVM] UnloadDriver called, cleaning up SvmBridge...\n");
+
+	/* [NEW] 清理批量散射读取 */
+	HvBatchRead_Cleanup();
+
 	StealthCleanup();
 	SvmBridge_Cleanup();
 

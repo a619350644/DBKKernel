@@ -45,6 +45,15 @@ NTSYSAPI NTSTATUS NTAPI MmCopyMemory(
 #include "ultimap2.h"
 
 #include "SvmBridge.h"  /* [NEW] SvmDebug bridge for handle elevation */
+#include "HvBatchRead.h" /* [NEW] 批量散射读取共享定义 */
+
+extern NTSTATUS HvBatchRead_Dispatch(
+	PVOID SystemBuffer,
+	ULONG InputLength,
+	ULONG OutputLength,
+	PULONG_PTR BytesReturned);
+
+extern BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG32 size);
 
 /* ========================================================================
  * 隐身内存引擎 — 直接内联在 IOPLDispatcher.c 中, 不依赖外部文件
@@ -485,33 +494,34 @@ void StealthCleanup(void)
 	RtlZeroMemory(g_Cr3Cache, sizeof(g_Cr3Cache));
 }
 
-/* ---- 本地虚拟内存查询 (零 IOCTL 到 SvmDebug) ----
+/* ---- 本地虚拟内存查询 ----
  *
- * [v17] 用 OBJ_KERNEL_HANDLE 打开目标进程, 直接 ZwQueryVirtualMemory
- * 不经过 SvmBridge IOCTL, 不经过 KeStackAttachProcess
- * 内核句柄绕过 ACE 的 ObRegisterCallbacks
+ * [v18] 用 KeStackAttachProcess + NtCurrentProcess() 查询目标进程
+ * ZwQueryVirtualMemory(-1, ...) 不走句柄, ACE 回调不触发
+ * 且 SvmDebug NPT Hook 中 ProcessHandle == NtCurrentProcess() 路径直接透传
+ * 修复 Memory Viewer 显示 ??? 的根因
  */
 static NTSTATUS StealthQueryVM(UINT64 pid, UINT64 startVa,
 	PUINT64 outBase, PUINT64 outSize, PULONG outProt, PULONG outState, PULONG outType)
 {
 	PEPROCESS proc = NULL;
-	HANDLE kHandle = NULL;
 	NTSTATUS st;
 	MEMORY_BASIC_INFORMATION mbi = { 0 };
 	SIZE_T retLen = 0;
+	KAPC_STATE apcState;
 
 	st = PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc);
 	if (!NT_SUCCESS(st) || !proc) return STATUS_NOT_FOUND;
 
-	/* OBJ_KERNEL_HANDLE → ACE ObCallback 跳过 */
-	st = ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL,
-		0x0400 /* PROCESS_QUERY_INFORMATION */, *PsProcessType, KernelMode, &kHandle);
-	ObDereferenceObject(proc);
-	if (!NT_SUCCESS(st)) return st;
+	/* attach 到目标进程, 用 NtCurrentProcess() 查询
+	 * ZwQueryVirtualMemory(-1, ...) 不走句柄, ACE 回调不触发 */
+	KeStackAttachProcess(proc, &apcState);
 
-	st = ZwQueryVirtualMemory(kHandle, (PVOID)(ULONG_PTR)startVa,
+	st = ZwQueryVirtualMemory(NtCurrentProcess(), (PVOID)(ULONG_PTR)startVa,
 		MemoryBasicInformation, &mbi, sizeof(mbi), &retLen);
-	ZwClose(kHandle);
+
+	KeUnstackDetachProcess(&apcState);
+	ObDereferenceObject(proc);
 
 	if (NT_SUCCESS(st)) {
 		if (outBase)  *outBase = (UINT64)mbi.BaseAddress;
@@ -962,14 +972,23 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread, (int)SvmBridge_IsActive());
 			}
 
-			/* [v17] 直接在 DBKKernel 中物理读取
-			 * 零 IOCTL 到 SvmDebug, 零 pool 分配
-			 * 98%+ 走 MmCopyMemory(PHYSICAL), ACE 完全不可见
-			 * paged-out 自动 fallback 到 KeStackAttachProcess */
+			/* [v18] 所有内存读取走 VMEXIT 路径
+			 * HvBatchRead_SingleRead: 1次 CPUID VMEXIT → VMM Host 物理直读
+			 * 完全不在 Guest R0 留下 MmCopyMemory 调用痕迹
+			 * fallback: BatchRead 未初始化时回退到 StealthDirectRead */
 			if (SvmBridge_IsActive())
 			{
-				ntStatus = StealthDirectRead(pinp->processid, pinp->startaddress,
-					pinp, pinp->bytestoread) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+				if (!HvBatchRead_SingleRead(pinp->processid, pinp->startaddress,
+					pinp, pinp->bytestoread))
+				{
+					/* VMEXIT 路径失败, 回退到 Guest R0 物理直读 */
+					ntStatus = StealthDirectRead(pinp->processid, pinp->startaddress,
+						pinp, pinp->bytestoread) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+				}
+				else
+				{
+					ntStatus = STATUS_SUCCESS;
+				}
 			}
 			else
 			{
@@ -3249,6 +3268,16 @@ case IOCTL_CE_GETCPUIDS:
 		}
 
 
+		break;
+	}
+
+	case IOCTL_CE_BATCH_READ:
+	{
+		ntStatus = HvBatchRead_Dispatch(
+			Irp->AssociatedIrp.SystemBuffer,
+			irpStack->Parameters.DeviceIoControl.InputBufferLength,
+			irpStack->Parameters.DeviceIoControl.OutputBufferLength,
+			&Irp->IoStatus.Information);
 		break;
 	}
 

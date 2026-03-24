@@ -31,9 +31,12 @@
 #define IOCTL_SVM_DISABLE_CALLBACKS   SVM_CTL(0x824)
 #define IOCTL_SVM_RESTORE_CALLBACKS   SVM_CTL(0x825)
 
-/* [NEW] 句柄升权 IOCTL (0x828-0x829, 与 DrvMain.cpp 对应) */
-#define IOCTL_SVM_ELEVATE_PID         SVM_CTL(0x828)
-#define IOCTL_SVM_UNELEVATE_PID       SVM_CTL(0x829)
+/* [NEW] 被调试进程标记 IOCTL (0x828-0x829, 与 DrvMain.cpp 对应) */
+#define IOCTL_SVM_SET_DEBUGGED_PID    SVM_CTL(0x828)
+#define IOCTL_SVM_UNSET_DEBUGGED_PID  SVM_CTL(0x829)
+/* [COMPAT] */
+#define IOCTL_SVM_ELEVATE_PID         IOCTL_SVM_SET_DEBUGGED_PID
+#define IOCTL_SVM_UNELEVATE_PID       IOCTL_SVM_UNSET_DEBUGGED_PID
 
 /* 调试类 IOCTL (0x830 系列) */
 #define IOCTL_DBG_REGISTER_DEBUGGER   SVM_CTL(0x830)
@@ -89,9 +92,12 @@ typedef struct _SVM_SW_BP_REQUEST {
 #define IOCTL_CE_SVM_REMOVE_SW_BP    SVM_CTL(0x906)  /* in: SVM_SW_BP_REQUEST */
 #define IOCTL_CE_SVM_CLEANUP         SVM_CTL(0x907)  /* 无输入 */
 
- /* [NEW] 被调试进程句柄升权 */
-#define IOCTL_CE_SVM_ELEVATE_PID     SVM_CTL(0x908)  /* 输入: ULONG64 targetPid */
-#define IOCTL_CE_SVM_UNELEVATE_PID   SVM_CTL(0x909)  /* 输入: ULONG64 targetPid */
+ /* [NEW] 被调试进程状态设置 */
+#define IOCTL_CE_SVM_SET_DEBUGGED    SVM_CTL(0x908)  /* 输入: ULONG64 targetPid */
+#define IOCTL_CE_SVM_UNSET_DEBUGGED  SVM_CTL(0x909)  /* 输入: ULONG64 targetPid */
+/* [COMPAT] */
+#define IOCTL_CE_SVM_ELEVATE_PID     IOCTL_CE_SVM_SET_DEBUGGED
+#define IOCTL_CE_SVM_UNELEVATE_PID   IOCTL_CE_SVM_UNSET_DEBUGGED
 
 /* ================================================================
  * SvmDebug HvMemory IOCTL (直接转发, 不经 CE 自定义 IOCTL)
@@ -171,15 +177,20 @@ NTSTATUS SvmBridge_RemoveSwBreakpoint(SVM_SW_BP_REQUEST* req);
 NTSTATUS SvmBridge_ClearAll(void);
 
 /**
- * [NEW] 升权目标进程 — 让被调试进程绕过 ACE 的 ObRegisterCallbacks 句柄降权。
- * 升权后，该进程的所有 ObpRef 调用会使用 DesiredAccess=0 + KernelMode 绕过权限检查。
+ * [NEW] 标记目标进程为被调试状态。
+ * CE attach 时调用, 将 PID 加入 SvmDebug 的 g_DebuggedPIDs。
  */
-NTSTATUS SvmBridge_ElevatePid(ULONG64 targetPid);
+NTSTATUS SvmBridge_SetDebuggedPid(ULONG64 targetPid);
 
 /**
- * [NEW] 移除目标进程的句柄升权。
+ * [NEW] 取消目标进程的被调试状态。
+ * CE detach 时调用。
  */
-NTSTATUS SvmBridge_UnelevatePid(ULONG64 targetPid);
+NTSTATUS SvmBridge_UnsetDebuggedPid(ULONG64 targetPid);
+
+/* [COMPAT] */
+#define SvmBridge_ElevatePid    SvmBridge_SetDebuggedPid
+#define SvmBridge_UnelevatePid  SvmBridge_UnsetDebuggedPid
 
 /**
  * [NEW] 通过 SvmDebug 调用真正的 ZwQueryVirtualMemory。

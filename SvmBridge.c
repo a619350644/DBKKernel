@@ -203,10 +203,9 @@ NTSTATUS SvmBridge_ProtectTarget(ULONG64 targetPid)
         return status;
     }
 
-    /* [NEW] 自动升权: 为被调试进程启用句柄绕过
-     * 使游戏进程的 ObpRef 调用使用 DesiredAccess=0 + KernelMode,
-     * 绕过 ACE 的 ObRegisterCallbacks 句柄降权 */
-    SvmBridge_ElevatePid(targetPid);
+    /* [NEW] 标记目标为被调试状态
+     * 各 Hook 函数据此判断: CE 操作该进程 → 完全透传 */
+    SvmBridge_SetDebuggedPid(targetPid);
 
     /* 附加调试 (影子调试端口) */
     status = SvmBridge_SendIoctl(
@@ -230,14 +229,23 @@ NTSTATUS SvmBridge_ProtectTarget(ULONG64 targetPid)
 NTSTATUS SvmBridge_DetachTarget(ULONG64 targetPid)
 {
     ULONG64 pid64 = targetPid;
+    NTSTATUS status;
 
     if (!g_SvmActive)
         return STATUS_DEVICE_NOT_READY;
 
-    return SvmBridge_SendIoctl(
+    /* [NEW] 先清除被调试状态 */
+    SvmBridge_UnsetDebuggedPid(targetPid);
+
+    status = SvmBridge_SendIoctl(
         IOCTL_DBG_DETACH_PROCESS,
         &pid64, sizeof(pid64),
         NULL, 0);
+
+    DbgPrint("[SvmBridge] Target PID %llu: detached + undebugged, status=0x%X\n",
+        targetPid, status);
+
+    return status;
 }
 
 /* ================================================================
@@ -278,14 +286,11 @@ NTSTATUS SvmBridge_ClearAll(void)
 }
 
 /* ================================================================
- * [NEW] 句柄升权 — 让被调试进程绕过 ACE 句柄降权
+ * [NEW] 被调试进程标记 — 语义从"升权"改为"被调试"
  *
- * 调用 SvmDebug 的 IOCTL_SVM_ELEVATE_PID,
- * 将目标 PID 加入 g_ElevatedPIDs 列表。
- * 之后该进程的所有 ObpRef 调用会使用 DesiredAccess=0 + KernelMode,
- * 绕过 ACE 的 ObRegisterCallbacks 句柄降权。
+ * IOCTL 码保持 0x828/0x829 不变, 只是语义更准确。
  * ================================================================ */
-NTSTATUS SvmBridge_ElevatePid(ULONG64 targetPid)
+NTSTATUS SvmBridge_SetDebuggedPid(ULONG64 targetPid)
 {
     SVM_PROTECT_INFO info = { 0 };
 
@@ -295,21 +300,21 @@ NTSTATUS SvmBridge_ElevatePid(ULONG64 targetPid)
     info.Pid = targetPid;
 
     NTSTATUS status = SvmBridge_SendIoctl(
-        IOCTL_SVM_ELEVATE_PID,
+        IOCTL_SVM_SET_DEBUGGED_PID,
         &info, sizeof(info),
         NULL, 0);
 
     if (NT_SUCCESS(status)) {
-        DbgPrint("[SvmBridge] PID %llu elevated (handle bypass active)\n", targetPid);
+        DbgPrint("[SvmBridge] PID %llu marked as debugged\n", targetPid);
     }
     else {
-        DbgPrint("[SvmBridge] Elevate PID %llu failed: 0x%X\n", targetPid, status);
+        DbgPrint("[SvmBridge] Set debugged PID %llu failed: 0x%X\n", targetPid, status);
     }
 
     return status;
 }
 
-NTSTATUS SvmBridge_UnelevatePid(ULONG64 targetPid)
+NTSTATUS SvmBridge_UnsetDebuggedPid(ULONG64 targetPid)
 {
     SVM_PROTECT_INFO info = { 0 };
 
@@ -319,15 +324,15 @@ NTSTATUS SvmBridge_UnelevatePid(ULONG64 targetPid)
     info.Pid = targetPid;
 
     NTSTATUS status = SvmBridge_SendIoctl(
-        IOCTL_SVM_UNELEVATE_PID,
+        IOCTL_SVM_UNSET_DEBUGGED_PID,
         &info, sizeof(info),
         NULL, 0);
 
     if (NT_SUCCESS(status)) {
-        DbgPrint("[SvmBridge] PID %llu unelevated\n", targetPid);
+        DbgPrint("[SvmBridge] PID %llu unmarked as debugged\n", targetPid);
     }
     else {
-        DbgPrint("[SvmBridge] Unelevate PID %llu failed: 0x%X\n", targetPid, status);
+        DbgPrint("[SvmBridge] Unset debugged PID %llu failed: 0x%X\n", targetPid, status);
     }
 
     return status;
@@ -480,25 +485,25 @@ NTSTATUS SvmBridge_DispatchIoctl(
      * [NEW] Handle elevation IOCTLs
      * CE R3 -> DBKKernel -> SvmBridge -> SvmDebug -> AddElevatedPid()
      * ================================================================ */
-    case IOCTL_CE_SVM_ELEVATE_PID:
+    case IOCTL_CE_SVM_SET_DEBUGGED:   /* 0x908, 兼容旧 IOCTL_CE_SVM_ELEVATE_PID */
     {
         if (InputLength < sizeof(ULONG64) || !InputBuffer) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
         ULONG64 targetPid = *(ULONG64*)InputBuffer;
-        status = SvmBridge_ElevatePid(targetPid);
+        status = SvmBridge_SetDebuggedPid(targetPid);
         break;
     }
 
-    case IOCTL_CE_SVM_UNELEVATE_PID:
+    case IOCTL_CE_SVM_UNSET_DEBUGGED:  /* 0x909, 兼容旧 IOCTL_CE_SVM_UNELEVATE_PID */
     {
         if (InputLength < sizeof(ULONG64) || !InputBuffer) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
         ULONG64 targetPid = *(ULONG64*)InputBuffer;
-        status = SvmBridge_UnelevatePid(targetPid);
+        status = SvmBridge_UnsetDebuggedPid(targetPid);
         break;
     }
 

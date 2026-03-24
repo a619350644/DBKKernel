@@ -343,6 +343,7 @@ makecab /f "$(ProjectDir)\dbk64.ddf"
     <ClCompile Include="vmxhelper.c" />
     <ClCompile Include="vmxoffload.c" />
     <ClCompile Include="SvmBridge.c" />
+    <ClCompile Include="HvBatchRead_Guest.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="cetc.h" />
@@ -369,6 +370,7 @@ makecab /f "$(ProjectDir)\dbk64.ddf"
     <ClInclude Include="vmxhelper.h" />
     <ClInclude Include="vmxoffload.h" />
     <ClInclude Include="SvmBridge.h" />
+    <ClInclude Include="HvBatchRead.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="amd64\dbkfunca.asm">
