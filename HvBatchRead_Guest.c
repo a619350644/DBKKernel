@@ -6,7 +6,7 @@
  *  添加到 DBKKernel 项目。需要在以下地方集成:
  *
  *  1. IOPLDispatcher.h 添加:
- *       #define IOCTL_CE_BATCH_READ  CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0860, 
+ *       #define IOCTL_CE_BATCH_READ  CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0860,
  *               METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
  *
  *  2. IOPLDispatcher.c 的 DispatchIoctl switch 中添加:
@@ -23,9 +23,9 @@
 #include "HvMemBridge.h"
 #include <intrin.h>
 
-/* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
- * __cpuidex does NOT set RBX, causing VMM to read garbage context PA.
- * See dbkfunca.asm for implementation. */
+ /* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
+  * __cpuidex does NOT set RBX, causing VMM to read garbage context PA.
+  * See dbkfunca.asm for implementation. */
 extern void HvCpuidWithRbx(int leaf, int subleaf, UINT64 rbxValue, int* regs);
 
 /* 前向声明 */
@@ -54,15 +54,15 @@ static FAST_MUTEX g_BatchMutex;
  *  初始化 / 清理
  * ======================================================================== */
 
-/**
- * @brief 初始化批量读取引擎
- *
- * 预分配所有物理连续缓冲区, 避免扫描时的内存分配开销。
- * 预分配大小:
- *   BatchContext: 1 PAGE  = 4KB
- *   ScatterTable: 512 × 24 = ~12KB → 4 pages = 16KB
- *   OutputBuffer: 2MB (可配置)
- */
+ /**
+  * @brief 初始化批量读取引擎
+  *
+  * 预分配所有物理连续缓冲区, 避免扫描时的内存分配开销。
+  * 预分配大小:
+  *   BatchContext: 1 PAGE  = 4KB
+  *   ScatterTable: 512 × 24 = ~12KB → 4 pages = 16KB
+  *   OutputBuffer: 2MB (可配置)
+  */
 NTSTATUS HvBatchRead_Init(void)
 {
     PHYSICAL_ADDRESS highAddr;
@@ -115,7 +115,7 @@ void HvBatchRead_Cleanup(void)
 
     if (g_OutputBuffer) { MmFreeContiguousMemory(g_OutputBuffer); g_OutputBuffer = NULL; }
     if (g_ScatterTable) { MmFreeContiguousMemory(g_ScatterTable); g_ScatterTable = NULL; }
-    if (g_BatchContext)  { MmFreeContiguousMemory(g_BatchContext);  g_BatchContext = NULL; }
+    if (g_BatchContext) { MmFreeContiguousMemory(g_BatchContext);  g_BatchContext = NULL; }
 
     ExReleaseFastMutex(&g_BatchMutex);
 }
@@ -132,12 +132,15 @@ static ULONG64 BatchGetCr3(ULONG64 pid)
         (PVOID)(UINT_PTR)pid, &proc)) || !proc)
         return 0;
 
-    /* KVAS: UserDirectoryTableBase (offset 0x280) 优先用于用户态 VA */
-    ULONG64 userCr3 = *(PULONG64)((PUCHAR)proc + 0x280);
-    if (userCr3 && (userCr3 & 0x000FFFFFFFFFF000ULL) != 0)
-        cr3 = userCr3 & 0x000FFFFFFFFFF000ULL;
-    else
-        cr3 = *(PULONG64)((PUCHAR)proc + 0x28) & 0x000FFFFFFFFFF000ULL;
+    /* [FIX] 始终使用 DirectoryTableBase (offset 0x28)
+     *
+     * 原代码优先使用 UserDirectoryTableBase (0x280), 仅 Intel KPTI 时有效。
+     * 在 AMD 系统上 KPTI 通常关闭, +0x280 包含无效标志值 (如 0x200001000),
+     * 导致 VMM 页表遍历全部失败 (success=0/1)。
+     *
+     * DirectoryTableBase (+0x28) 无论 KPTI 开关都映射完整地址空间 (用户+内核),
+     * 是最可靠的 CR3 来源。 */
+    cr3 = *(PULONG64)((PUCHAR)proc + 0x28) & 0x000FFFFFFFFFF000ULL;
 
     ObDereferenceObject(proc);
     return cr3;
@@ -153,17 +156,17 @@ static ULONG64 BatchGetCr3(ULONG64 pid)
  *    4. 返回后, 输出缓冲区已由 VMM 填充
  * ======================================================================== */
 
-/**
- * @brief 执行一批散射读取
- *
- * @param pid        目标进程 PID
- * @param entries    CE 请求的读取条目数组
- * @param count      条目数 (1 ~ HV_BATCH_MAX_ENTRIES)
- * @param output     [OUT] 读取结果缓冲区 (调用者分配)
- * @param outputSize 输出缓冲区大小
- * @param pSuccess   [OUT] 成功读取的条目数
- * @return STATUS_SUCCESS 或错误码
- */
+ /**
+  * @brief 执行一批散射读取
+  *
+  * @param pid        目标进程 PID
+  * @param entries    CE 请求的读取条目数组
+  * @param count      条目数 (1 ~ HV_BATCH_MAX_ENTRIES)
+  * @param output     [OUT] 读取结果缓冲区 (调用者分配)
+  * @param outputSize 输出缓冲区大小
+  * @param pSuccess   [OUT] 成功读取的条目数
+  * @return STATUS_SUCCESS 或错误码
+  */
 static NTSTATUS DoBatchRead(
     ULONG64 pid,
     PBATCH_READ_ENTRY entries,
@@ -193,11 +196,11 @@ static NTSTATUS DoBatchRead(
         if (entries[i].Size == 0 || entries[i].Size > PAGE_SIZE)
             return STATUS_INVALID_PARAMETER;
 
-        g_ScatterTable[i].GuestVa     = entries[i].Address;
-        g_ScatterTable[i].Size         = entries[i].Size;
+        g_ScatterTable[i].GuestVa = entries[i].Address;
+        g_ScatterTable[i].Size = entries[i].Size;
         g_ScatterTable[i].OutputOffset = totalDataSize;
-        g_ScatterTable[i].Status       = 0xFFFFFFFF; /* 未处理 */
-        g_ScatterTable[i].Reserved     = 0;
+        g_ScatterTable[i].Status = 0xFFFFFFFF; /* 未处理 */
+        g_ScatterTable[i].Reserved = 0;
 
         totalDataSize += entries[i].Size;
     }
@@ -211,12 +214,12 @@ static NTSTATUS DoBatchRead(
 
     /* 填充 BatchContext */
     RtlZeroMemory(g_BatchContext, sizeof(HV_BATCH_CONTEXT));
-    g_BatchContext->TargetCr3       = cr3;
-    g_BatchContext->EntryCount      = count;
+    g_BatchContext->TargetCr3 = cr3;
+    g_BatchContext->EntryCount = count;
     g_BatchContext->TotalOutputSize = totalDataSize;
-    g_BatchContext->EntriesPa       = g_ScatterTablePa;
-    g_BatchContext->OutputPa        = g_OutputBufferPa;
-    g_BatchContext->Status           = 1; /* Pending */
+    g_BatchContext->EntriesPa = g_ScatterTablePa;
+    g_BatchContext->OutputPa = g_OutputBufferPa;
+    g_BatchContext->Status = 1; /* Pending */
 
     /* 内存屏障: 确保所有写入在 CPUID 前对 VMM 可见 */
     KeMemoryBarrier();
@@ -307,16 +310,16 @@ BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG
  *    [BATCH_READ_OUTPUT header] [Data × TotalSize]
  * ======================================================================== */
 
-/**
- * @brief 处理 IOCTL_CE_BATCH_READ
- *
- * 在 IOPLDispatcher.c 的 switch(IoControlCode) 中调用:
- *   case IOCTL_CE_BATCH_READ:
- *       ntStatus = HvBatchRead_Dispatch(
- *           Irp->AssociatedIrp.SystemBuffer,
- *           inputLength, outputLength, &info);
- *       break;
- */
+ /**
+  * @brief 处理 IOCTL_CE_BATCH_READ
+  *
+  * 在 IOPLDispatcher.c 的 switch(IoControlCode) 中调用:
+  *   case IOCTL_CE_BATCH_READ:
+  *       ntStatus = HvBatchRead_Dispatch(
+  *           Irp->AssociatedIrp.SystemBuffer,
+  *           inputLength, outputLength, &info);
+  *       break;
+  */
 NTSTATUS HvBatchRead_Dispatch(
     PVOID SystemBuffer,
     ULONG InputLength,

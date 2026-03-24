@@ -283,11 +283,13 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 				failList[failCount].Va = va;
 				failList[failCount].Chunk = chunk;
 				failCount++;
-			} else {
+			}
+			else {
 				/* failList 满, 填零 */
 				RtlZeroMemory(dst + done, chunk);
 			}
-		} else {
+		}
+		else {
 			anyRead = TRUE;
 		}
 
@@ -1025,7 +1027,8 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 						DbgPrint("[SVM-CE] VMEXIT READ FAIL (zero-fill, NO Guest R0 fallback) #%d: PID=%llu addr=0x%llX size=%u\n",
 							fbCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
 					}
-					__try { RtlZeroMemory(pinp, pinp->bytestoread); } __except(1) {}
+					__try { RtlZeroMemory(pinp, pinp->bytestoread); }
+					__except (1) {}
 					ntStatus = STATUS_SUCCESS;  /* 返回 SUCCESS + 零数据, CE 不会报错 */
 				}
 				else
@@ -1034,7 +1037,8 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					if (okCnt <= 20 || (okCnt % 5000) == 0) {
 						UCHAR preview[8] = { 0 };
 						ULONG previewLen = (pinp->bytestoread >= 8) ? 8 : pinp->bytestoread;
-						__try { RtlCopyMemory(preview, pinp, previewLen); } __except(1) {}
+						__try { RtlCopyMemory(preview, pinp, previewLen); }
+						__except (1) {}
 						DbgPrint("[SVM-CE] VMEXIT READ OK #%d: PID=%llu addr=0x%llX size=%u data[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X\n",
 							okCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
 							preview[0], preview[1], preview[2], preview[3],
@@ -1742,24 +1746,37 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 	case IOCTL_CE_LAUNCHDBVM:
 	{
-		struct intput
+		/* [SVM-FIX] DBVM is an Intel VMX hypervisor. On AMD systems with SvmDebug,
+		 * launching DBVM will: disable paging → switch CR3 → jump to 0x00400000
+		 * → guaranteed triple-fault → instant BSOD/reboot.
+		 * Block this IOCTL entirely when running on AMD+SVM. */
+		if (SvmBridge_IsActive())
 		{
-			UINT64 dbvmimgpath;
-			DWORD32 cpuid;
-		} *pinp;
-		pinp = Irp->AssociatedIrp.SystemBuffer;
-		DbgPrint("IOCTL_CE_LAUNCHDBVM\n");
-
-		initializeDBVM((PCWSTR)(UINT_PTR)pinp->dbvmimgpath);
-
-		if (pinp->cpuid == 0xffffffff) {
-			forEachCpu(vmxoffload_dpc, NULL, NULL, NULL, vmxoffload_override);
-			cleanupDBVM();
+			DbgPrint("[DBK-SVM] IOCTL_CE_LAUNCHDBVM BLOCKED: DBVM is Intel-only, SvmDebug provides equivalent functionality on AMD\n");
+			ntStatus = STATUS_NOT_SUPPORTED;
+			break;
 		}
-		else
-			forOneCpu((CCHAR)pinp->cpuid, vmxoffload_dpc, NULL, NULL, NULL, vmxoffload_override);
 
-		DbgPrint("Returned from vmxoffload()\n");
+		{
+			struct intput
+			{
+				UINT64 dbvmimgpath;
+				DWORD32 cpuid;
+			} *pinp;
+			pinp = Irp->AssociatedIrp.SystemBuffer;
+			DbgPrint("IOCTL_CE_LAUNCHDBVM\n");
+
+			initializeDBVM((PCWSTR)(UINT_PTR)pinp->dbvmimgpath);
+
+			if (pinp->cpuid == 0xffffffff) {
+				forEachCpu(vmxoffload_dpc, NULL, NULL, NULL, vmxoffload_override);
+				cleanupDBVM();
+			}
+			else
+				forOneCpu((CCHAR)pinp->cpuid, vmxoffload_dpc, NULL, NULL, NULL, vmxoffload_override);
+
+			DbgPrint("Returned from vmxoffload()\n");
+		}
 		break;
 	}
 
@@ -2998,6 +3015,17 @@ case IOCTL_CE_GETCPUIDS:
 		ntStatus = STATUS_SUCCESS;
 
 		pinp = Irp->AssociatedIrp.SystemBuffer;
+
+		/* [SVM-FIX] When SvmDebug is active, vmx_getversion() executes vmmcall
+		 * with DBVM password registers. SvmDebug's VMM does not understand the
+		 * DBVM password protocol — the vmmcall may be mishandled.
+		 * Skip the DBVM check entirely; SvmDebug provides all needed features. */
+		if (SvmBridge_IsActive())
+		{
+			DbgPrint("[DBK-SVM] VMXCONFIG: SvmDebug active, skipping DBVM vmmcall probe\n");
+			vmxusable = 0;  /* DBVM is not running — SvmDebug is the hypervisor */
+			break;
+		}
 
 		if (pinp->Virtualization_Enabled)
 		{
