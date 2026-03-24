@@ -156,6 +156,38 @@ getSegmentLimit:
   lsl rax,rcx
   ret
 
+; =========================================================================
+; @brief Execute CPUID with RBX set to a specific value (context PA)
+;
+; [BUG FIX] __cpuidex does NOT set RBX before CPUID.
+; The VMM reads vpData->Guest_gpr.Rbx to get the shared context PA.
+; This function explicitly sets RBX = rbxValue before executing CPUID,
+; so the VMM receives the correct context physical address.
+;
+; @param RCX = CPUID leaf (EAX)
+; @param RDX = CPUID sub-leaf (ECX)  
+; @param R8  = RBX value to set (context PA)
+; @param R9  = pointer to int[4] for output {eax, ebx, ecx, edx}
+; =========================================================================
+PUBLIC HvCpuidWithRbx
+HvCpuidWithRbx:
+    push rbx              ; save caller's RBX (callee-saved register)
+    
+    mov eax, ecx          ; EAX = leaf
+    mov ecx, edx          ; ECX = sub-leaf
+    mov rbx, r8           ; RBX = context physical address
+    
+    cpuid                 ; VMEXIT here — VMM reads RBX as context PA
+    
+    ; Store results to output array
+    mov [r9],    eax      ; regs[0] = EAX
+    mov [r9+4],  ebx      ; regs[1] = EBX 
+    mov [r9+8],  ecx      ; regs[2] = ECX
+    mov [r9+12], edx      ; regs[3] = EDX
+    
+    pop rbx               ; restore caller's RBX
+    ret
+
 _TEXT   ENDS
         END
 

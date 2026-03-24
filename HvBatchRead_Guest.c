@@ -23,6 +23,11 @@
 #include "HvMemBridge.h"
 #include <intrin.h>
 
+/* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
+ * __cpuidex does NOT set RBX, causing VMM to read garbage context PA.
+ * See dbkfunca.asm for implementation. */
+extern void HvCpuidWithRbx(int leaf, int subleaf, UINT64 rbxValue, int* regs);
+
 /* 前向声明 */
 void HvBatchRead_Cleanup(void);
 
@@ -225,8 +230,11 @@ static NTSTATUS DoBatchRead(
         }
     }
 
-    /* ★ 一次 CPUID — 一次 VMEXIT — VMM 读取所有条目 ★ */
-    __cpuidex(regs, CPUID_HV_BATCH_READ, 0);
+    /* ★ 一次 CPUID — 一次 VMEXIT — VMM 读取所有条目 ★
+     * [BUG FIX] 使用 HvCpuidWithRbx 设置 RBX = g_BatchContextPa
+     * 旧代码 __cpuidex 不设置 RBX, VMM 读到的 RBX 是垃圾值
+     * 导致 VMM 映射错误的物理地址, batch read 全部失败 */
+    HvCpuidWithRbx(CPUID_HV_BATCH_READ, 0, g_BatchContextPa, regs);
 
     /* VMRUN 返回, 输出缓冲区已填充 */
     if (g_BatchContext->Status > 0) {

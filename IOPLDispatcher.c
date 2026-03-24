@@ -46,6 +46,7 @@ NTSYSAPI NTSTATUS NTAPI MmCopyMemory(
 
 #include "SvmBridge.h"  /* [NEW] SvmDebug bridge for handle elevation */
 #include "HvBatchRead.h" /* [NEW] 批量散射读取共享定义 */
+#include "HvMemBridge.h" /* [v19] VMEXIT 写入: HvBridge_WriteProcessMemory */
 
 extern NTSTATUS HvBatchRead_Dispatch(
 	PVOID SystemBuffer,
@@ -496,10 +497,19 @@ void StealthCleanup(void)
 
 /* ---- 本地虚拟内存查询 ----
  *
- * [v18] 用 KeStackAttachProcess + NtCurrentProcess() 查询目标进程
- * ZwQueryVirtualMemory(-1, ...) 不走句柄, ACE 回调不触发
- * 且 SvmDebug NPT Hook 中 ProcessHandle == NtCurrentProcess() 路径直接透传
- * 修复 Memory Viewer 显示 ??? 的根因
+ * [v19 BUG FIX] 使用 ObOpenObjectByPointer + kernel handle 查询目标进程
+ *
+ * 旧方式 (v18):
+ *   KeStackAttachProcess(target) + ZwQueryVirtualMemory(NtCurrentProcess(), ...)
+ *   问题: NPT Hook Fake_NtQueryVirtualMemory 检测到 ProcessHandle == NtCurrentProcess()
+ *         && 进程不是 CE (已 attach 到 target) → 触发"自查伪装"代码
+ *         → 把 PAGE_EXECUTE_READWRITE 改成 PAGE_READONLY
+ *         → CE 看到错误的保护属性 → Memory Viewer 显示 ??? + First Scan 跳过区域
+ *
+ * 新方式 (v19):
+ *   ObOpenObjectByPointer(target) → ZwQueryVirtualMemory(kernelHandle, ...)
+ *   NPT Hook 检测到 ProcessHandle 不是 NtCurrentProcess() + 调用者 PID 在保护列表
+ *   → 走 CE 外部查询透传路径 → 返回真实保护属性
  */
 static NTSTATUS StealthQueryVM(UINT64 pid, UINT64 startVa,
 	PUINT64 outBase, PUINT64 outSize, PULONG outProt, PULONG outState, PULONG outType)
@@ -508,20 +518,34 @@ static NTSTATUS StealthQueryVM(UINT64 pid, UINT64 startVa,
 	NTSTATUS st;
 	MEMORY_BASIC_INFORMATION mbi = { 0 };
 	SIZE_T retLen = 0;
-	KAPC_STATE apcState;
+	HANDLE kernelHandle = NULL;
 
 	st = PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc);
 	if (!NT_SUCCESS(st) || !proc) return STATUS_NOT_FOUND;
 
-	/* attach 到目标进程, 用 NtCurrentProcess() 查询
-	 * ZwQueryVirtualMemory(-1, ...) 不走句柄, ACE 回调不触发 */
-	KeStackAttachProcess(proc, &apcState);
+	/* [BUG FIX] 使用 kernel handle 替代 KeStackAttachProcess + NtCurrentProcess()
+	 * kernel handle 不走 ObRegisterCallbacks, ACE 看不到
+	 * 且 NPT Hook 不会触发"自查伪装" (因为 ProcessHandle != NtCurrentProcess()) */
+	st = ObOpenObjectByPointer(
+		proc,
+		OBJ_KERNEL_HANDLE,
+		NULL,
+		PROCESS_QUERY_INFORMATION,
+		*PsProcessType,
+		KernelMode,
+		&kernelHandle);
 
-	st = ZwQueryVirtualMemory(NtCurrentProcess(), (PVOID)(ULONG_PTR)startVa,
+	ObDereferenceObject(proc);
+
+	if (!NT_SUCCESS(st) || !kernelHandle) {
+		DbgPrint("[QVM] ObOpenObjectByPointer failed: 0x%X pid=%llu\n", st, pid);
+		return st;
+	}
+
+	st = ZwQueryVirtualMemory(kernelHandle, (PVOID)(ULONG_PTR)startVa,
 		MemoryBasicInformation, &mbi, sizeof(mbi), &retLen);
 
-	KeUnstackDetachProcess(&apcState);
-	ObDereferenceObject(proc);
+	ZwClose(kernelHandle);
 
 	if (NT_SUCCESS(st)) {
 		if (outBase)  *outBase = (UINT64)mbi.BaseAddress;
@@ -972,36 +996,49 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 			{
 				LONG diagSeq = InterlockedIncrement(&s_readDiag);
-				if (diagSeq <= 5) {
+				if (diagSeq <= 20) {
 					DbgPrint("[SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
-						diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread, (int)SvmBridge_IsActive());
+						diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
+						(int)SvmBridge_IsActive());
 				}
 			}
 
-			/* [v18] 所有内存读取走 VMEXIT 路径
+			/* [v19] 所有内存读取强制走 VMEXIT 路径, 零 Guest R0 内存操作
 			 * HvBatchRead_SingleRead: 1次 CPUID VMEXIT → VMM Host 物理直读
-			 * 完全不在 Guest R0 留下 MmCopyMemory 调用痕迹
-			 * fallback: BatchRead 未初始化时回退到 StealthDirectRead */
+			 * 完全不在 Guest R0 留下任何 MmCopyMemory/KeStackAttachProcess 痕迹
+			 *
+			 * 如果 VMEXIT 失败 (页面被换出/未映射), 填零而非回退到 Guest R0
+			 * 原因: KeStackAttachProcess/MmCopyMemory 会在 Guest R0 留下调用栈痕迹
+			 * 页面换出时 Memory Viewer 显示 00 是可接受的 (等同于未映射)
+			 */
 			if (SvmBridge_IsActive())
 			{
 				if (!HvBatchRead_SingleRead(pinp->processid, pinp->startaddress,
 					pinp, pinp->bytestoread))
 				{
-					/* VMEXIT 路径失败, 回退到 Guest R0 物理直读 */
+					/* ★ VMEXIT 失败 — 不回退到 Guest R0 ★
+					 * 原因: 页面可能被换出 (PTE not present), VMM 无法翻译 VA
+					 * 填零处理: Memory Viewer 显示 00, First Scan 跳过该区域
+					 * 不调用 StealthDirectRead/MmCopyMemory 以保持完全不可见 */
 					LONG fbCnt = InterlockedIncrement(&s_fallbackCount);
-					if (fbCnt <= 10 || (fbCnt % 2000) == 0) {
-						DbgPrint("[SVM-CE] !! FALLBACK #%d: StealthDirectRead PID=%llu addr=0x%llX size=%u\n",
+					if (fbCnt <= 50 || (fbCnt % 1000) == 0) {
+						DbgPrint("[SVM-CE] VMEXIT READ FAIL (zero-fill, NO Guest R0 fallback) #%d: PID=%llu addr=0x%llX size=%u\n",
 							fbCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
 					}
-					ntStatus = StealthDirectRead(pinp->processid, pinp->startaddress,
-						pinp, pinp->bytestoread) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+					__try { RtlZeroMemory(pinp, pinp->bytestoread); } __except(1) {}
+					ntStatus = STATUS_SUCCESS;  /* 返回 SUCCESS + 零数据, CE 不会报错 */
 				}
 				else
 				{
 					LONG okCnt = InterlockedIncrement(&s_vmexitOkCount);
-					if (okCnt <= 10 || (okCnt % 5000) == 0) {
-						DbgPrint("[SVM-CE] VMEXIT READ OK #%d: PID=%llu addr=0x%llX size=%u\n",
-							okCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+					if (okCnt <= 20 || (okCnt % 5000) == 0) {
+						UCHAR preview[8] = { 0 };
+						ULONG previewLen = (pinp->bytestoread >= 8) ? 8 : pinp->bytestoread;
+						__try { RtlCopyMemory(preview, pinp, previewLen); } __except(1) {}
+						DbgPrint("[SVM-CE] VMEXIT READ OK #%d: PID=%llu addr=0x%llX size=%u data[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+							okCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
+							preview[0], preview[1], preview[2], preview[3],
+							preview[4], preview[5], preview[6], preview[7]);
 					}
 					ntStatus = STATUS_SUCCESS;
 				}
@@ -1037,19 +1074,23 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			DbgPrint("sizeof(inp)=%d\n", sizeof(inp));
 			pinp = Irp->AssociatedIrp.SystemBuffer;
 
-			/* [v17] 直接在 DBKKernel 中 attach 写入
-			 * 零 IOCTL 到 SvmDebug, 零 MmMapIoSpace (避免 BSOD 0x1A) */
+			/* [v19] 所有内存写入也走 VMEXIT 路径
+			 * HvBridge_WriteProcessMemory: CPUID(CPUID_HV_MEMORY_OP) → VMEXIT → VMM Host 物理写入
+			 * Guest R0 零 MmMapIoSpace / KeStackAttachProcess 痕迹 */
 			if (SvmBridge_IsActive())
 			{
 				static volatile LONG s_writeDiag = 0;
 				LONG wCnt = InterlockedIncrement(&s_writeDiag);
-				if (wCnt <= 10 || (wCnt % 2000) == 0) {
-					DbgPrint("[SVM-CE] WRITE #%d (Guest R0 StealthDirectWrite, NOT VMEXIT): PID=%llu addr=0x%llX size=%u\n",
+				if (wCnt <= 20 || (wCnt % 2000) == 0) {
+					DbgPrint("[SVM-CE] WRITE VMEXIT #%d: PID=%llu addr=0x%llX size=%u\n",
 						wCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestowrite);
 				}
-				ntStatus = StealthDirectWrite(pinp->processid, pinp->startaddress,
-					(PVOID)((UINT_PTR)pinp + sizeof(inp)),
-					pinp->bytestowrite) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+				ntStatus = HvBridge_WriteProcessMemory(
+					(DWORD)pinp->processid, NULL,
+					(PVOID)(UINT_PTR)pinp->startaddress,
+					pinp->bytestowrite,
+					(PVOID)((UINT_PTR)pinp + sizeof(inp)))
+					? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 			}
 			else
 			{
@@ -1268,16 +1309,18 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				UINT64 qvmBase = 0, qvmSize = 0;
 				ULONG  qvmProt = 0, qvmState = 0, qvmType = 0;
 
-				/* [v17] 本地 kernel handle 查询, 零 IOCTL 到 SvmDebug */
+				/* [v19 BUG FIX] 使用 ObOpenObjectByPointer kernel handle 查询
+				 * 旧 v18 用 KeStackAttachProcess+NtCurrentProcess() → NPT Hook 伪装保护属性
+				 * → Memory Viewer ???, First Scan 空结果 */
 				ntStatus = StealthQueryVM(
 					PInputBuf->ProcessID,
 					PInputBuf->StartAddress,
 					&qvmBase, &qvmSize, &qvmProt, &qvmState, &qvmType);
 
-				if (InterlockedIncrement(&s_qvmDiag) <= 5) {
-					DbgPrint("[QVM-DIAG] StealthQueryVM: PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X\n",
+				if (InterlockedIncrement(&s_qvmDiag) <= 20) {
+					DbgPrint("[QVM-DIAG] StealthQueryVM(KernelHandle): PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X type=0x%X\n",
 						PInputBuf->ProcessID, PInputBuf->StartAddress,
-						ntStatus, qvmBase, qvmSize, qvmProt, qvmState);
+						ntStatus, qvmBase, qvmSize, qvmProt, qvmState, qvmType);
 				}
 
 				if (NT_SUCCESS(ntStatus)) {

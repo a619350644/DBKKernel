@@ -10,6 +10,13 @@
 #include "HvMemBridge.h"
 #include <intrin.h>
 
+/* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
+ * Without this, VMM reads garbage RBX instead of g_BridgeContextPa.
+ * Also, VMM used to forcibly overwrite RBX with g_HvSharedContextPa,
+ * which is SvmDebug's own context, not DBKKernel's context.
+ * Both bugs are fixed: ASM sets RBX correctly, VMM no longer overwrites it. */
+extern void HvCpuidWithRbx(int leaf, int subleaf, UINT64 rbxValue, int* regs);
+
  /* Guest ↔ VMM 通信的共享上下文页 */
 static PHV_RW_CONTEXT g_BridgeContext = NULL;
 static ULONG64 g_BridgeContextPa = 0;
@@ -140,11 +147,15 @@ static BOOLEAN DoHypercallMemoryOp(
     /* 内存屏障: 确保写入在超级调用前可见 */
     KeMemoryBarrier();
 
-    /* 发起超级调用 */
+    /* 发起超级调用
+     * [BUG FIX] 使用 HvCpuidWithRbx 设置 RBX = g_BridgeContextPa
+     * 旧代码 __cpuidex 不设置 RBX, 且 VMM 强制覆盖 RBX 为 g_HvSharedContextPa
+     * 导致 VMM 读取 SvmDebug 自己的上下文(全零/旧数据), 而非 DBKKernel 填的上下文 */
     {
         int regs[4] = { 0 };
-        __cpuidex(regs, CPUID_HV_MEMORY_OP,
-            IsWrite ? HV_MEM_OP_WRITE : HV_MEM_OP_READ);
+        HvCpuidWithRbx(CPUID_HV_MEMORY_OP,
+            IsWrite ? HV_MEM_OP_WRITE : HV_MEM_OP_READ,
+            g_BridgeContextPa, regs);
     }
 
     return (g_BridgeContext->Status == 0);
