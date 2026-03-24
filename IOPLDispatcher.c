@@ -964,12 +964,18 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				WORD bytestoread;
 			} *pinp;
 			static volatile LONG s_readDiag = 0;
+			static volatile LONG s_vmexitOkCount = 0;
+			static volatile LONG s_fallbackCount = 0;
+			static volatile LONG s_legacyCount = 0;
 
 			pinp = Irp->AssociatedIrp.SystemBuffer;
 
-			if (InterlockedIncrement(&s_readDiag) <= 3) {
-				DbgPrint("[SVM-CE] IOCTL_CE_READMEMORY: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
-					pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread, (int)SvmBridge_IsActive());
+			{
+				LONG diagSeq = InterlockedIncrement(&s_readDiag);
+				if (diagSeq <= 5) {
+					DbgPrint("[SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
+						diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread, (int)SvmBridge_IsActive());
+				}
 			}
 
 			/* [v18] 所有内存读取走 VMEXIT 路径
@@ -982,16 +988,31 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					pinp, pinp->bytestoread))
 				{
 					/* VMEXIT 路径失败, 回退到 Guest R0 物理直读 */
+					LONG fbCnt = InterlockedIncrement(&s_fallbackCount);
+					if (fbCnt <= 10 || (fbCnt % 2000) == 0) {
+						DbgPrint("[SVM-CE] !! FALLBACK #%d: StealthDirectRead PID=%llu addr=0x%llX size=%u\n",
+							fbCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+					}
 					ntStatus = StealthDirectRead(pinp->processid, pinp->startaddress,
 						pinp, pinp->bytestoread) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 				}
 				else
 				{
+					LONG okCnt = InterlockedIncrement(&s_vmexitOkCount);
+					if (okCnt <= 10 || (okCnt % 5000) == 0) {
+						DbgPrint("[SVM-CE] VMEXIT READ OK #%d: PID=%llu addr=0x%llX size=%u\n",
+							okCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+					}
 					ntStatus = STATUS_SUCCESS;
 				}
 			}
 			else
 			{
+				LONG legCnt = InterlockedIncrement(&s_legacyCount);
+				if (legCnt <= 5 || (legCnt % 5000) == 0) {
+					DbgPrint("[SVM-CE] LEGACY READ (no SVM) #%d: PID=%llu addr=0x%llX size=%u\n",
+						legCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+				}
 				ntStatus = ReadProcessMemory((DWORD)pinp->processid, NULL, (PVOID)(UINT_PTR)pinp->startaddress, pinp->bytestoread, pinp) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 			}
 		}
@@ -1020,6 +1041,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			 * 零 IOCTL 到 SvmDebug, 零 MmMapIoSpace (避免 BSOD 0x1A) */
 			if (SvmBridge_IsActive())
 			{
+				static volatile LONG s_writeDiag = 0;
+				LONG wCnt = InterlockedIncrement(&s_writeDiag);
+				if (wCnt <= 10 || (wCnt % 2000) == 0) {
+					DbgPrint("[SVM-CE] WRITE #%d (Guest R0 StealthDirectWrite, NOT VMEXIT): PID=%llu addr=0x%llX size=%u\n",
+						wCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestowrite);
+				}
 				ntStatus = StealthDirectWrite(pinp->processid, pinp->startaddress,
 					(PVOID)((UINT_PTR)pinp + sizeof(inp)),
 					pinp->bytestowrite) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;

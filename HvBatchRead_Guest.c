@@ -170,10 +170,17 @@ static NTSTATUS DoBatchRead(
     ULONG64 cr3;
     int regs[4] = { 0 };
     ULONG32 totalDataSize = 0;
+    static volatile LONG s_batchDiag = 0;
 
     *pSuccess = 0;
 
-    if (!g_BatchInitialized) return STATUS_DEVICE_NOT_READY;
+    if (!g_BatchInitialized) {
+        LONG dCnt = InterlockedIncrement(&s_batchDiag);
+        if (dCnt <= 5) {
+            DbgPrint("[BatchRead] NOT INITIALIZED — will fallback! (call #%d)\n", dCnt);
+        }
+        return STATUS_DEVICE_NOT_READY;
+    }
     if (count == 0 || count > HV_BATCH_MAX_ENTRIES) return STATUS_INVALID_PARAMETER;
 
     /* 计算总输出大小并填充散射表 */
@@ -209,13 +216,37 @@ static NTSTATUS DoBatchRead(
     /* 内存屏障: 确保所有写入在 CPUID 前对 VMM 可见 */
     KeMemoryBarrier();
 
+    {
+        static volatile LONG s_cpuidTrigger = 0;
+        LONG tCnt = InterlockedIncrement(&s_cpuidTrigger);
+        if (tCnt <= 10 || (tCnt % 5000) == 0) {
+            DbgPrint("[BatchRead] >>> CPUID VMEXIT #%d: leaf=0x%X CR3=0x%llX entries=%u totalSize=%u\n",
+                tCnt, CPUID_HV_BATCH_READ, cr3, count, totalDataSize);
+        }
+    }
+
     /* ★ 一次 CPUID — 一次 VMEXIT — VMM 读取所有条目 ★ */
     __cpuidex(regs, CPUID_HV_BATCH_READ, 0);
 
     /* VMRUN 返回, 输出缓冲区已填充 */
     if (g_BatchContext->Status > 0) {
         /* VMM 未处理 (可能 Hypervisor 不支持 CPUID_HV_BATCH_READ) */
+        static volatile LONG s_notSupported = 0;
+        LONG nsCnt = InterlockedIncrement(&s_notSupported);
+        if (nsCnt <= 10) {
+            DbgPrint("[BatchRead] !!! VMM NOT SUPPORTED: Status=%d (CPUID_HV_BATCH_READ not handled?)\n",
+                g_BatchContext->Status);
+        }
         return STATUS_NOT_SUPPORTED;
+    }
+
+    {
+        static volatile LONG s_cpuidDone = 0;
+        LONG dCnt = InterlockedIncrement(&s_cpuidDone);
+        if (dCnt <= 10 || (dCnt % 5000) == 0) {
+            DbgPrint("[BatchRead] <<< VMEXIT DONE #%d: Status=%d SuccessCount=%u/%u\n",
+                dCnt, g_BatchContext->Status, g_BatchContext->SuccessCount, count);
+        }
     }
 
     /* 拷贝结果到调用者缓冲区 */
