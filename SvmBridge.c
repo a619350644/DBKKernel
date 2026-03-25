@@ -203,11 +203,16 @@ NTSTATUS SvmBridge_ProtectTarget(ULONG64 targetPid)
         return status;
     }
 
-    /* [NEW] 标记目标为被调试状态
-     * 各 Hook 函数据此判断: CE 操作该进程 → 完全透传 */
-    SvmBridge_SetDebuggedPid(targetPid);
+    /* [FIX] 1. 先标记目标为被调试状态
+     * 各 Hook 函数据此判断: CE 操作该进程 → 完全透传
+     * 必须在 AttachProcess 之前, 确保 Attach 时已标记 */
+    status = SvmBridge_SetDebuggedPid(targetPid);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[SvmBridge] SetDebuggedPid %llu failed: 0x%X\n", targetPid, status);
+        return status;
+    }
 
-    /* 附加调试 (影子调试端口) */
+    /* [FIX] 2. 再附加调试 (影子调试端口) */
     status = SvmBridge_SendIoctl(
         IOCTL_DBG_ATTACH_PROCESS,
         &pid64, sizeof(pid64),
@@ -217,7 +222,9 @@ NTSTATUS SvmBridge_ProtectTarget(ULONG64 targetPid)
         DbgPrint("[SvmBridge] Target PID %llu: protected + elevated + debug attached\n", targetPid);
     }
     else {
-        DbgPrint("[SvmBridge] Attach PID %llu failed: 0x%X\n", targetPid, status);
+        DbgPrint("[SvmBridge] Attach PID %llu failed: 0x%X, rolling back\n",
+                 targetPid, status);
+        SvmBridge_UnsetDebuggedPid(targetPid);
     }
 
     return status;
@@ -234,13 +241,13 @@ NTSTATUS SvmBridge_DetachTarget(ULONG64 targetPid)
     if (!g_SvmActive)
         return STATUS_DEVICE_NOT_READY;
 
-    /* [NEW] 先清除被调试状态 */
-    SvmBridge_UnsetDebuggedPid(targetPid);
-
+    /* [FIX] 先移除调试端口，再清除标记 */
     status = SvmBridge_SendIoctl(
         IOCTL_DBG_DETACH_PROCESS,
         &pid64, sizeof(pid64),
         NULL, 0);
+
+    SvmBridge_UnsetDebuggedPid(targetPid);
 
     DbgPrint("[SvmBridge] Target PID %llu: detached + undebugged, status=0x%X\n",
         targetPid, status);
