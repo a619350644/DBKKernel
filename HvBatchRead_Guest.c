@@ -3,19 +3,19 @@
  * @brief Guest 侧批量散射读取实现 (DBKKernel 项目)
  *
  * ═══════════════════════════════════════════════════════════════════════
- *  添加到 DBKKernel 项目。需要在以下地方集成:
+ * 添加到 DBKKernel 项目。需要在以下地方集成:
  *
- *  1. IOPLDispatcher.h 添加:
- *       #define IOCTL_CE_BATCH_READ  CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0860,
- *               METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+ * 1. IOPLDispatcher.h 添加:
+ *    #define IOCTL_CE_BATCH_READ CTL_CODE(IOCTL_UNKNOWN_BASE, 0x0860,
+ *            METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
  *
- *  2. IOPLDispatcher.c 的 DispatchIoctl switch 中添加:
- *       case IOCTL_CE_BATCH_READ:
- *           ntStatus = HvBatchRead_HandleIoctl(Irp, ...);
- *           break;
+ * 2. IOPLDispatcher.c 的 DispatchIoctl switch 中添加:
+ *    case IOCTL_CE_BATCH_READ:
+ *        ntStatus = HvBatchRead_HandleIoctl(Irp, ...);
+ *        break;
  *
- *  3. HvBridge_Init() 后调用 HvBatchRead_Init()
- *  4. HvBridge_Cleanup() 前调用 HvBatchRead_Cleanup()
+ * 3. HvBridge_Init() 后调用 HvBatchRead_Init()
+ * 4. HvBridge_Cleanup() 前调用 HvBatchRead_Cleanup()
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -32,18 +32,19 @@ extern void HvCpuidWithRbx(int leaf, int subleaf, UINT64 rbxValue, int* regs);
 void HvBatchRead_Cleanup(void);
 
 /* ========================================================================
- *  全局状态
+ * 全局状态
  * ======================================================================== */
+
 static PHV_BATCH_CONTEXT g_BatchContext = NULL;
-static ULONG64 g_BatchContextPa = 0;
-static BOOLEAN g_BatchInitialized = FALSE;
+static ULONG64           g_BatchContextPa = 0;
+static BOOLEAN           g_BatchInitialized = FALSE;
 
 /* 预分配散射表 (避免每次扫描时分配) */
 static PHV_SCATTER_ENTRY g_ScatterTable = NULL;
-static ULONG64 g_ScatterTablePa = 0;
+static ULONG64           g_ScatterTablePa = 0;
 
 /* 预分配输出缓冲区 (物理连续, 最大 4MB) */
-static PVOID g_OutputBuffer = NULL;
+static PVOID   g_OutputBuffer = NULL;
 static ULONG64 g_OutputBufferPa = 0;
 static ULONG32 g_OutputBufferSize = 0;
 
@@ -51,7 +52,7 @@ static ULONG32 g_OutputBufferSize = 0;
 static FAST_MUTEX g_BatchMutex;
 
 /* ========================================================================
- *  初始化 / 清理
+ * 初始化 / 清理
  * ======================================================================== */
 
  /**
@@ -59,7 +60,7 @@ static FAST_MUTEX g_BatchMutex;
   *
   * 预分配所有物理连续缓冲区, 避免扫描时的内存分配开销。
   * 预分配大小:
-  *   BatchContext: 1 PAGE  = 4KB
+  *   BatchContext: 1 PAGE = 4KB
   *   ScatterTable: 512 × 24 = ~12KB → 4 pages = 16KB
   *   OutputBuffer: 2MB (可配置)
   */
@@ -113,16 +114,17 @@ void HvBatchRead_Cleanup(void)
     /* 获取锁, 等待正在进行的 DoBatchRead 完成 */
     ExAcquireFastMutex(&g_BatchMutex);
 
-    if (g_OutputBuffer) { MmFreeContiguousMemory(g_OutputBuffer); g_OutputBuffer = NULL; }
-    if (g_ScatterTable) { MmFreeContiguousMemory(g_ScatterTable); g_ScatterTable = NULL; }
+    if (g_OutputBuffer) { MmFreeContiguousMemory(g_OutputBuffer);  g_OutputBuffer = NULL; }
+    if (g_ScatterTable) { MmFreeContiguousMemory(g_ScatterTable);  g_ScatterTable = NULL; }
     if (g_BatchContext) { MmFreeContiguousMemory(g_BatchContext);  g_BatchContext = NULL; }
 
     ExReleaseFastMutex(&g_BatchMutex);
 }
 
 /* ========================================================================
- *  获取进程 CR3
+ * 获取进程 CR3
  * ======================================================================== */
+
 static ULONG64 BatchGetCr3(ULONG64 pid)
 {
     PEPROCESS proc = NULL;
@@ -147,33 +149,33 @@ static ULONG64 BatchGetCr3(ULONG64 pid)
 }
 
 /* ========================================================================
- *  核心: 执行批量读取
+ * 核心: 执行批量读取
  *
- *  Guest 侧操作:
- *    1. 填充散射表
- *    2. 填充 BatchContext
- *    3. 发起 CPUID(CPUID_HV_BATCH_READ) — 一次 VMEXIT
- *    4. 返回后, 输出缓冲区已由 VMM 填充
+ * Guest 侧操作:
+ *   1. 填充散射表
+ *   2. 填充 BatchContext
+ *   3. 发起 CPUID(CPUID_HV_BATCH_READ) — 一次 VMEXIT
+ *   4. 返回后, 输出缓冲区已由 VMM 填充
  * ======================================================================== */
 
  /**
   * @brief 执行一批散射读取
   *
-  * @param pid        目标进程 PID
-  * @param entries    CE 请求的读取条目数组
-  * @param count      条目数 (1 ~ HV_BATCH_MAX_ENTRIES)
-  * @param output     [OUT] 读取结果缓冲区 (调用者分配)
-  * @param outputSize 输出缓冲区大小
-  * @param pSuccess   [OUT] 成功读取的条目数
+  * @param pid         目标进程 PID
+  * @param entries     CE 请求的读取条目数组
+  * @param count       条目数 (1 ~ HV_BATCH_MAX_ENTRIES)
+  * @param output      [OUT] 读取结果缓冲区 (调用者分配)
+  * @param outputSize  输出缓冲区大小
+  * @param pSuccess    [OUT] 成功读取的条目数
   * @return STATUS_SUCCESS 或错误码
   */
 static NTSTATUS DoBatchRead(
-    ULONG64 pid,
+    ULONG64          pid,
     PBATCH_READ_ENTRY entries,
-    ULONG32 count,
-    PVOID output,
-    ULONG32 outputSize,
-    PULONG32 pSuccess)
+    ULONG32          count,
+    PVOID            output,
+    ULONG32          outputSize,
+    PULONG32         pSuccess)
 {
     ULONG64 cr3;
     int regs[4] = { 0 };
@@ -189,6 +191,7 @@ static NTSTATUS DoBatchRead(
         }
         return STATUS_DEVICE_NOT_READY;
     }
+
     if (count == 0 || count > HV_BATCH_MAX_ENTRIES) return STATUS_INVALID_PARAMETER;
 
     /* 计算总输出大小并填充散射表 */
@@ -237,9 +240,16 @@ static NTSTATUS DoBatchRead(
      * [BUG FIX] 使用 HvCpuidWithRbx 设置 RBX = g_BatchContextPa
      * 旧代码 __cpuidex 不设置 RBX, VMM 读到的 RBX 是垃圾值
      * 导致 VMM 映射错误的物理地址, batch read 全部失败 */
+    {
+        static volatile LONG _t5 = 0;
+        if (InterlockedCompareExchange(&_t5, 1, 0) == 0)
+            DbgPrint("[SVM-TRACE] [BatchRead] >>> Issuing CPUID(0x%X) VMEXIT, CR3=0x%llX\n",
+                CPUID_HV_BATCH_READ, cr3);
+    }
     HvCpuidWithRbx(CPUID_HV_BATCH_READ, 0, g_BatchContextPa, regs);
 
     /* VMRUN 返回, 输出缓冲区已填充 */
+
     if (g_BatchContext->Status > 0) {
         /* VMM 未处理 (可能 Hypervisor 不支持 CPUID_HV_BATCH_READ) */
         static volatile LONG s_notSupported = 0;
@@ -260,32 +270,58 @@ static NTSTATUS DoBatchRead(
         }
     }
 
-    /* 拷贝结果到调用者缓冲区 */
-    __try {
-        RtlCopyMemory(output, g_OutputBuffer, totalDataSize);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return STATUS_ACCESS_VIOLATION;
+    /* [BUG FIX] 仅在有成功读取时才拷贝输出
+     *
+     * 旧代码无条件拷贝 g_OutputBuffer → output, 即使 SuccessCount == 0
+     * 问题:
+     *   1. g_OutputBuffer 可能包含上一次成功读取的残留旧数据 → 返回错误数据
+     *   2. 当 output == IOPLDispatcher 的 pinp (SystemBuffer) 时,
+     *      无条件拷贝会覆写 pinp->processid / startaddress / bytestoread
+     *      → 后续零填充使用损坏的 bytestoread → 越界写入 → 蓝屏
+     */
+    * pSuccess = g_BatchContext->SuccessCount;
+
+    {
+        static volatile LONG _t6 = 0;
+        if (InterlockedCompareExchange(&_t6, 1, 0) == 0)
+            DbgPrint("[SVM-TRACE] [BatchRead] <<< VMEXIT returned, Status=%d SuccessCount=%u/%u\n",
+                g_BatchContext->Status, g_BatchContext->SuccessCount, count);
     }
 
-    *pSuccess = g_BatchContext->SuccessCount;
+    if (*pSuccess > 0) {
+        __try {
+            RtlCopyMemory(output, g_OutputBuffer, totalDataSize);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return STATUS_ACCESS_VIOLATION;
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
 /* ========================================================================
- *  单次 VMEXIT 读取 — 供 IOCTL_CE_READMEMORY 使用
+ * 单次 VMEXIT 读取 — 供 IOCTL_CE_READMEMORY 使用
  *
- *  将单次内存读取也走 VMEXIT 路径, 确保 First Scan / Memory Viewer
- *  等所有读取操作都不在 Guest R0 留下物理读取痕迹。
+ * 将单次内存读取也走 VMEXIT 路径, 确保 First Scan / Memory Viewer
+ * 等所有读取操作都不在 Guest R0 留下物理读取痕迹。
  *
- *  R3 已经将大块读取拆分为 ≤4096 字节的页对齐块,
- *  每次 IOCTL 调用此函数 = 1 次 CPUID VMEXIT。
+ * R3 已经将大块读取拆分为 ≤4096 字节的页对齐块,
+ * 每次 IOCTL 调用此函数 = 1 次 CPUID VMEXIT。
  * ======================================================================== */
+
 BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG32 size)
 {
     BATCH_READ_ENTRY entry;
     ULONG32 success = 0;
     NTSTATUS status;
+
+    {
+        static volatile LONG _t7 = 0;
+        if (InterlockedCompareExchange(&_t7, 1, 0) == 0)
+            DbgPrint("[SVM-TRACE] [SingleRead] >>> Entry: pid=%llu addr=0x%llX size=%u\n",
+                pid, address, size);
+    }
 
     if (!g_BatchInitialized || size == 0 || size > PAGE_SIZE || !output)
         return FALSE;
@@ -301,13 +337,13 @@ BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG
 }
 
 /* ========================================================================
- *  IOCTL 处理器 — CE DeviceIoControl 入口
+ * IOCTL 处理器 — CE DeviceIoControl 入口
  *
- *  输入布局 (SystemBuffer):
- *    [BATCH_READ_INPUT header] [BATCH_READ_ENTRY × Count]
+ * 输入布局 (SystemBuffer):
+ *   [BATCH_READ_INPUT header] [BATCH_READ_ENTRY × Count]
  *
- *  输出布局 (SystemBuffer):
- *    [BATCH_READ_OUTPUT header] [Data × TotalSize]
+ * 输出布局 (SystemBuffer):
+ *   [BATCH_READ_OUTPUT header] [Data × TotalSize]
  * ======================================================================== */
 
  /**
@@ -321,10 +357,10 @@ BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG
   *       break;
   */
 NTSTATUS HvBatchRead_Dispatch(
-    PVOID SystemBuffer,
-    ULONG InputLength,
-    ULONG OutputLength,
-    PULONG_PTR BytesReturned)
+    PVOID       SystemBuffer,
+    ULONG       InputLength,
+    ULONG       OutputLength,
+    PULONG_PTR  BytesReturned)
 {
     NTSTATUS status;
     PBATCH_READ_INPUT inp;

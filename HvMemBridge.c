@@ -10,17 +10,17 @@
 #include "HvMemBridge.h"
 #include <intrin.h>
 
-/* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
- * Without this, VMM reads garbage RBX instead of g_BridgeContextPa.
- * Also, VMM used to forcibly overwrite RBX with g_HvSharedContextPa,
- * which is SvmDebug's own context, not DBKKernel's context.
- * Both bugs are fixed: ASM sets RBX correctly, VMM no longer overwrites it. */
+ /* [BUG FIX] ASM helper: sets RBX = context PA before CPUID
+  * Without this, VMM reads garbage RBX instead of g_BridgeContextPa.
+  * Also, VMM used to forcibly overwrite RBX with g_HvSharedContextPa,
+  * which is SvmDebug's own context, not DBKKernel's context.
+  * Both bugs are fixed: ASM sets RBX correctly, VMM no longer overwrites it. */
 extern void HvCpuidWithRbx(int leaf, int subleaf, UINT64 rbxValue, int* regs);
 
- /* Guest ↔ VMM 通信的共享上下文页 */
+/* Guest ↔ VMM 通信的共享上下文页 */
 static PHV_RW_CONTEXT g_BridgeContext = NULL;
-static ULONG64 g_BridgeContextPa = 0;
-static BOOLEAN g_BridgeInitialized = FALSE;
+static ULONG64        g_BridgeContextPa = 0;
+static BOOLEAN        g_BridgeInitialized = FALSE;
 
 /* 检查 SvmDebug Hypervisor 是否在运行 */
 BOOLEAN HvBridge_IsHypervisorPresent(void)
@@ -29,6 +29,7 @@ BOOLEAN HvBridge_IsHypervisorPresent(void)
     char vendorId[13] = { 0 };
 
     __cpuid(regs, 0x40000000);
+
     *(int*)(vendorId + 0) = regs[1];
     *(int*)(vendorId + 4) = regs[2];
     *(int*)(vendorId + 8) = regs[3];
@@ -59,7 +60,6 @@ NTSTATUS HvBridge_Init(void)
     /* 分配共享上下文页 (连续物理内存) */
     g_BridgeContext = (PHV_RW_CONTEXT)MmAllocateContiguousMemory(
         PAGE_SIZE, highAddr);
-
     if (!g_BridgeContext) {
         DbgPrint("[HvBridge] Failed to allocate shared context\n");
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -102,8 +102,23 @@ static ULONG64 GetProcessDirBase(DWORD PID, PEPROCESS PEProcess)
         }
     }
 
-    /* DirectoryTableBase 偏移, Win10 x64 所有版本均为 0x28 */
-    ULONG64 cr3 = *(PULONG64)((PUCHAR)proc + 0x28);
+    /* [BUG FIX] 添加 CR3 掩码 — 与 BatchGetCr3 保持一致
+     *
+     * 旧代码: cr3 = *(PULONG64)((PUCHAR)proc + 0x28);  // 无掩码!
+     * 问题: DirectoryTableBase 低 12 位可能包含 PCID 或缓存控制标志
+     *       如果这些位非零, VMM 页表遍历从错误物理地址开始
+     *       → 写入失败或写入到错误位置
+     *
+     * 新代码: 清除低 12 位 + 高 12 位 (bit 52-63 是保留/NX 标志)
+     * 这与读取路径 (BatchGetCr3) 完全一致 */
+    ULONG64 cr3 = *(PULONG64)((PUCHAR)proc + 0x28) & 0x000FFFFFFFFFF000ULL;
+
+    {
+        static volatile LONG _t8 = 0;
+        if (InterlockedCompareExchange(&_t8, 1, 0) == 0)
+            DbgPrint("[SVM-TRACE] [MemBridge] GetProcessDirBase: PID=%u CR3=0x%llX (masked)\n",
+                PID, cr3);
+    }
 
     if (PEProcess == NULL) {
         ObDereferenceObject(proc);
@@ -118,8 +133,8 @@ static ULONG64 GetProcessDirBase(DWORD PID, PEPROCESS PEProcess)
 static BOOLEAN DoHypercallMemoryOp(
     ULONG64 TargetCr3,
     ULONG64 TargetVa,
-    PVOID KernelBuffer,
-    DWORD Size,
+    PVOID   KernelBuffer,
+    DWORD   Size,
     BOOLEAN IsWrite)
 {
     if (!g_BridgeInitialized || !g_BridgeContext) {
@@ -172,14 +187,14 @@ static BOOLEAN DoHypercallMemoryOp(
  * VMM 侧 PhysicalMemoryCopy_Vmm 用 bpa+offset 寻址, 要求缓冲区物理连续
  */
 BOOLEAN HvBridge_ReadProcessMemory(
-    DWORD PID,
+    DWORD     PID,
     PEPROCESS PEProcess,
-    PVOID Address,
-    DWORD Size,
-    PVOID Buffer)
+    PVOID     Address,
+    DWORD     Size,
+    PVOID     Buffer)
 {
     ULONG64 targetCr3;
-    PVOID kernelBuf;
+    PVOID   kernelBuf;
     BOOLEAN success;
     PHYSICAL_ADDRESS highAddr;
 
@@ -226,14 +241,14 @@ BOOLEAN HvBridge_ReadProcessMemory(
  * [v18] 一次 CPUID 超级调用处理整个写入请求
  */
 BOOLEAN HvBridge_WriteProcessMemory(
-    DWORD PID,
+    DWORD     PID,
     PEPROCESS PEProcess,
-    PVOID Address,
-    DWORD Size,
-    PVOID Buffer)
+    PVOID     Address,
+    DWORD     Size,
+    PVOID     Buffer)
 {
     ULONG64 targetCr3;
-    PVOID kernelBuf;
+    PVOID   kernelBuf;
     BOOLEAN success;
     PHYSICAL_ADDRESS highAddr;
 
@@ -276,19 +291,19 @@ BOOLEAN HvBridge_WriteProcessMemory(
  * @brief 通过内核句柄查询虚拟内存区域 — 替代 KeAttachProcess + ZwQueryVirtualMemory
  */
 BOOLEAN HvBridge_QueryVirtualMemory(
-    DWORD PID,
-    PEPROCESS PEProcess,
-    PVOID Address,
-    PVOID MemoryInfo,
-    SIZE_T InfoLength,
-    PUINT_PTR pRegionLength,
-    PUINT_PTR pBaseAddress)
+    DWORD      PID,
+    PEPROCESS  PEProcess,
+    PVOID      Address,
+    PVOID      MemoryInfo,
+    SIZE_T     InfoLength,
+    PUINT_PTR  pRegionLength,
+    PUINT_PTR  pBaseAddress)
 {
     PEPROCESS proc = PEProcess;
-    NTSTATUS status;
-    BOOLEAN needDeref = FALSE;
-    HANDLE kernelHandle = NULL;
-    SIZE_T returnLength = 0;
+    NTSTATUS  status;
+    BOOLEAN   needDeref = FALSE;
+    HANDLE    kernelHandle = NULL;
+    SIZE_T    returnLength = 0;
 
     /* MEMORY_BASIC_INFORMATION 内部定义, 避免与用户态头文件冲突 */
     struct {
@@ -338,11 +353,10 @@ BOOLEAN HvBridge_QueryVirtualMemory(
 
     /* 使用内核句柄查询 — 不需要 KeAttachProcess */
     RtlZeroMemory(&mbi, sizeof(mbi));
-
     status = ZwQueryVirtualMemory(
         kernelHandle,
         Address,
-        0,  /* MemoryBasicInformation */
+        0, /* MemoryBasicInformation */
         &mbi,
         sizeof(mbi),
         &returnLength);

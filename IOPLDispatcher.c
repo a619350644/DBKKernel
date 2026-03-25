@@ -57,18 +57,35 @@ extern NTSTATUS HvBatchRead_Dispatch(
 extern BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output, ULONG32 size);
 
 /* ========================================================================
- * 隐身内存引擎 — 直接内联在 IOPLDispatcher.c 中, 不依赖外部文件
- *
- * 核心原理: 所有物理内存读取使用 MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
- *   - 不调用 MmGetVirtualForPhysical (旧代码根因: 读到 CE 自己的页表)
- *   - 不调用 MmMapIoSpace (ACE 检测系统 PTE 分配模式)
- *   - 不受当前进程上下文影响 (修复 Memory View 错误内存)
- *
- * CR3 掩码: 0x000FFFFFFFFFF000 只保留 bit12-51
- *   - 旧代码 ~0xFFF 保留 bit63(NOFLUSH) 导致物理地址错误
- *
- * KVAS 回退: 先用 +0x28, 失败时回退 +0x280
+ * [TRACE] 一次性路径追踪宏 — 每个调用点只打印一次, 确认链路是否走通
  * ======================================================================== */
+#define SVM_TRACE_ONCE(tag, msg) do { \
+	static volatile LONG _traced = 0; \
+	if (InterlockedCompareExchange(&_traced, 1, 0) == 0) { \
+		DbgPrint("[SVM-TRACE] [%s] %s\n", tag, msg); \
+	} \
+} while(0)
+
+#define SVM_TRACE_ONCE_V(tag, fmt, ...) do { \
+	static volatile LONG _traced = 0; \
+	if (InterlockedCompareExchange(&_traced, 1, 0) == 0) { \
+		DbgPrint("[SVM-TRACE] [%s] " fmt "\n", tag, __VA_ARGS__); \
+	} \
+} while(0)
+
+ /* ========================================================================
+  * 隐身内存引擎 — 直接内联在 IOPLDispatcher.c 中, 不依赖外部文件
+  *
+  * 核心原理: 所有物理内存读取使用 MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
+  *   - 不调用 MmGetVirtualForPhysical (旧代码根因: 读到 CE 自己的页表)
+  *   - 不调用 MmMapIoSpace (ACE 检测系统 PTE 分配模式)
+  *   - 不受当前进程上下文影响 (修复 Memory View 错误内存)
+  *
+  * CR3 掩码: 0x000FFFFFFFFFF000 只保留 bit12-51
+  *   - 旧代码 ~0xFFF 保留 bit63(NOFLUSH) 导致物理地址错误
+  *
+  * KVAS 回退: 先用 +0x28, 失败时回退 +0x280
+  * ======================================================================== */
 
 #define STEALTH_CR3_PA_MASK      0x000FFFFFFFFFF000ULL
 #define STEALTH_PT_ENTRIES       512
@@ -76,7 +93,7 @@ extern BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output
 #define STEALTH_EPROCESS_DTB     0x28
 #define STEALTH_EPROCESS_UDTTB   0x280
 
- /* ---- 物理内存读取原语 ---- */
+  /* ---- 物理内存读取原语 ---- */
 static __forceinline BOOLEAN StealthReadPhysical(UINT64 Pa, PVOID Out, SIZE_T Len)
 {
 	MM_COPY_ADDRESS src;
@@ -256,6 +273,15 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 	ULONG failCount = 0;
 
 	if (!size || !outBuf) return FALSE;
+
+	/* [FIX] 每次读取前重置页表缓存 + CR3 缓存
+	 * 问题: StealthTranslateVa 的 KVAS 回退会把 g_Cr3Cache 中的 CR3
+	 *       替换为 UserDirectoryTableBase (+0x280), 在 AMD 上这通常是无效值。
+	 *       First Scan 期间替换了 → Next Scan 用错误 CR3 → 翻译全失败 → Found:0
+	 * 修复: 同时清除 g_PtCache 和当前 pid 的 CR3 缓存, 强制每次重新读取 */
+	StealthResetCache();
+	StealthInvalidateCr3(pid);
+
 	cr3 = StealthGetCr3(pid);
 	if (!cr3) return FALSE;
 
@@ -981,6 +1007,10 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 	{
 
 	case IOCTL_CE_READMEMORY:
+		/* [DIAG] 无条件打印 - 每次进入 IOCTL_CE_READMEMORY 都会输出 */
+		DbgPrint("[DIAG] IOCTL_CE_READMEMORY entry, SvmActive=%d\n",
+			(int)SvmBridge_IsActive());
+
 		__try
 		{
 			struct input
@@ -1015,35 +1045,40 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			 */
 			if (SvmBridge_IsActive())
 			{
-				if (!HvBatchRead_SingleRead(pinp->processid, pinp->startaddress,
-					pinp, pinp->bytestoread))
+				SVM_TRACE_ONCE("READMEM", ">>> Entering StealthDirectRead path (MmCopyMemory + attach fallback)");
+
+				/* [FIX] 使用 StealthDirectRead 替代 HvBatchRead_SingleRead
+				 *
+				 * 为什么换掉 HvBatchRead (CPUID VMEXIT):
+				 *   HvBatchRead_SingleRead → CPUID(0x41414151) → VMM 物理直读
+				 *   但日志中从未出现过 [BatchRead] 前缀的打印
+				 *   → 要么 VMM 没有处理该 CPUID leaf, 要么 DoBatchRead 初始化失败
+				 *   → 读取全部返回零 → First Scan Found:0
+				 *
+				 * StealthDirectRead 的优势:
+				 *   1. MmCopyMemory(MM_COPY_MEMORY_PHYSICAL) 物理直读 — 不走任何 hook
+				 *   2. paged-out 页面自动 attach 兜底 — 不丢数据
+				 *   3. 已在 IOPLDispatcher.c 中实现并验证
+				 */
+				UINT64 savedPid = pinp->processid;
+				UINT64 savedAddr = pinp->startaddress;
+				WORD   savedSize = pinp->bytestoread;
+
+				if (StealthDirectRead(savedPid, savedAddr, pinp, savedSize))
 				{
-					/* ★ VMEXIT 失败 — 不回退到 Guest R0 ★
-					 * 原因: 页面可能被换出 (PTE not present), VMM 无法翻译 VA
-					 * 填零处理: Memory Viewer 显示 00, First Scan 跳过该区域
-					 * 不调用 StealthDirectRead/MmCopyMemory 以保持完全不可见 */
-					LONG fbCnt = InterlockedIncrement(&s_fallbackCount);
-					if (fbCnt <= 50 || (fbCnt % 1000) == 0) {
-						DbgPrint("[SVM-CE] VMEXIT READ FAIL (zero-fill, NO Guest R0 fallback) #%d: PID=%llu addr=0x%llX size=%u\n",
-							fbCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
-					}
-					__try { RtlZeroMemory(pinp, pinp->bytestoread); }
-					__except (1) {}
-					ntStatus = STATUS_SUCCESS;  /* 返回 SUCCESS + 零数据, CE 不会报错 */
+					SVM_TRACE_ONCE("READMEM", "<<< StealthDirectRead SUCCESS");
+					ntStatus = STATUS_SUCCESS;
 				}
 				else
 				{
-					LONG okCnt = InterlockedIncrement(&s_vmexitOkCount);
-					if (okCnt <= 20 || (okCnt % 5000) == 0) {
-						UCHAR preview[8] = { 0 };
-						ULONG previewLen = (pinp->bytestoread >= 8) ? 8 : pinp->bytestoread;
-						__try { RtlCopyMemory(preview, pinp, previewLen); }
-						__except (1) {}
-						DbgPrint("[SVM-CE] VMEXIT READ OK #%d: PID=%llu addr=0x%llX size=%u data[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-							okCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
-							preview[0], preview[1], preview[2], preview[3],
-							preview[4], preview[5], preview[6], preview[7]);
+					static volatile LONG s_readFail = 0;
+					LONG fCnt = InterlockedIncrement(&s_readFail);
+					if (fCnt <= 20 || (fCnt % 5000) == 0) {
+						DbgPrint("[SVM-CE] StealthDirectRead FAIL #%d: PID=%llu addr=0x%llX size=%u\n",
+							fCnt, savedPid, savedAddr, (UINT)savedSize);
 					}
+					__try { RtlZeroMemory(pinp, savedSize); }
+					__except (1) {}
 					ntStatus = STATUS_SUCCESS;
 				}
 			}
@@ -1310,19 +1345,31 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 			if (SvmBridge_IsActive())
 			{
+				SVM_TRACE_ONCE("QVM", ">>> Entering StealthQueryVM path (ZwQueryVirtualMemory + kernel handle)");
+
+				/* [FIX] 使用 StealthQueryVM (ZwQueryVirtualMemory + kernel handle)
+				 *
+				 * 为什么不能用物理页表遍历 (PhysWalk):
+				 *   PhysWalk 只查物理 PTE, 不查 Windows VAD (Virtual Address Descriptor)
+				 *   已提交但未映射的页面 (MEM_COMMIT, PTE not present) 显示为 prot=0
+				 *   → CE 看到整个地址空间几乎都是 "Free" → First Scan 跳过 → Found:0
+				 *
+				 * 为什么 StealthQueryVM 现在能工作:
+				 *   StealthQueryVM 创建 kernel handle → ZwQueryVirtualMemory
+				 *   → NPT Hook Fake_NtQueryVirtualMemory → PATH-B
+				 *   → 再次创建 kernel handle (OBJ_KERNEL_HANDLE, 绕过 ObRegisterCallbacks)
+				 *   → 调用原始 NtQueryVirtualMemory → 返回正确的 VAD 信息
+				 */
 				UINT64 qvmBase = 0, qvmSize = 0;
 				ULONG  qvmProt = 0, qvmState = 0, qvmType = 0;
 
-				/* [v19 BUG FIX] 使用 ObOpenObjectByPointer kernel handle 查询
-				 * 旧 v18 用 KeStackAttachProcess+NtCurrentProcess() → NPT Hook 伪装保护属性
-				 * → Memory Viewer ???, First Scan 空结果 */
 				ntStatus = StealthQueryVM(
 					PInputBuf->ProcessID,
 					PInputBuf->StartAddress,
 					&qvmBase, &qvmSize, &qvmProt, &qvmState, &qvmType);
 
-				if (InterlockedIncrement(&s_qvmDiag) <= 20) {
-					DbgPrint("[QVM-DIAG] StealthQueryVM(KernelHandle): PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X type=0x%X\n",
+				if (InterlockedIncrement(&s_qvmDiag) <= 30) {
+					DbgPrint("[QVM-DIAG] StealthQueryVM: PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X\n",
 						PInputBuf->ProcessID, PInputBuf->StartAddress,
 						ntStatus, qvmBase, qvmSize, qvmProt, qvmState, qvmType);
 				}
@@ -1332,10 +1379,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					length = (UINT_PTR)qvmSize;
 					POutputBuf->protection = qvmProt;
 					svmHandled = TRUE;
+
+					SVM_TRACE_ONCE_V("QVM", "<<< StealthQueryVM SUCCESS: prot=0x%X size=0x%llX state=0x%X", qvmProt, qvmSize, qvmState);
 				}
 			}
 
-			/* SVM 未激活 或 IOCTL 失败 → 回退到原始路径 */
+			/* SVM 未激活 或 物理页表遍历失败 → 回退到原始路径 */
 			if (!svmHandled)
 			{
 				ntStatus = GetMemoryRegionData((DWORD)PInputBuf->ProcessID, NULL, (PVOID)(UINT_PTR)(PInputBuf->StartAddress), &(POutputBuf->protection), &length, &BaseAddress);
