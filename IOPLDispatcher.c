@@ -13,6 +13,7 @@
 #ifndef MM_COPY_MEMORY_VIRTUAL
 #define MM_COPY_MEMORY_VIRTUAL  0x2
 #endif
+
 static HANDLE  g_hSvmDev = NULL;
 static BOOLEAN g_SvmDevOpened = FALSE;
 typedef union _MM_COPY_ADDRESS {
@@ -26,6 +27,14 @@ NTSYSAPI NTSTATUS NTAPI MmCopyMemory(
 	SIZE_T          NumberOfBytes,
 	ULONG           Flags,
 	PSIZE_T         NumberOfBytesTransferred
+);
+
+/* [FIX-v21] MmCopyVirtualMemory — 已导出, 用于替代 KeStackAttachProcess */
+NTSYSAPI NTSTATUS NTAPI MmCopyVirtualMemory(
+	PEPROCESS SourceProcess, PVOID SourceAddress,
+	PEPROCESS TargetProcess, PVOID TargetAddress,
+	SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
+	PSIZE_T ReturnSize
 );
 
 
@@ -62,14 +71,14 @@ extern BOOLEAN HvBatchRead_SingleRead(ULONG64 pid, ULONG64 address, PVOID output
 #define SVM_TRACE_ONCE(tag, msg) do { \
 	static volatile LONG _traced = 0; \
 	if (InterlockedCompareExchange(&_traced, 1, 0) == 0) { \
-		DbgPrint("[SVM-TRACE] [%s] %s\n", tag, msg); \
+		DbgPrint("[SvmDebug] [SVM-TRACE] [%s] %s\n", tag, msg); \
 	} \
 } while(0)
 
 #define SVM_TRACE_ONCE_V(tag, fmt, ...) do { \
 	static volatile LONG _traced = 0; \
 	if (InterlockedCompareExchange(&_traced, 1, 0) == 0) { \
-		DbgPrint("[SVM-TRACE] [%s] " fmt "\n", tag, __VA_ARGS__); \
+		DbgPrint("[SvmDebug] [SVM-TRACE] [%s] " fmt "\n", tag, __VA_ARGS__); \
 	} \
 } while(0)
 
@@ -201,47 +210,35 @@ static UINT64 StealthGetUserCr3(UINT64 pid)
 	return 0;
 }
 
-/* ---- VA → PA 翻译 (四级缓存) ---- */
+/* ---- VA → PA 翻译 (无全局缓存, 线程安全) ----
+ *
+ * [FIX-v21] 每次直接读 8 字节 PTE, 不依赖全局 g_PtCache
+ *   g_PtCache 全局变量 CE 多线程并发时存在竞争 → 翻译结果错乱
+ *   4 次 MmCopyMemory(8B) 开销完全可接受
+ */
+static __forceinline BOOLEAN StealthReadPte(UINT64 tablePa, UINT64 index, PUINT64 pte)
+{
+	UINT64 entryPa = (tablePa & ~0xFFFULL) + (index & 0x1FF) * sizeof(UINT64);
+	return StealthReadPhysical(entryPa, pte, sizeof(UINT64));
+}
+
 static UINT64 StealthTranslateVaInternal(UINT64 cr3, UINT64 va)
 {
 	UINT64 e;
-	if (g_PtCache.Cr3 != cr3) { StealthResetCache(); g_PtCache.Cr3 = cr3; }
-
-	e = StealthCachedPte(&g_PtCache.Pml4, cr3 & ~0xFFFULL, (va >> 39) & 0x1FF);
-	if (!(e & 1)) return 0;
-	e = StealthCachedPte(&g_PtCache.Pdpt, e & STEALTH_CR3_PA_MASK, (va >> 30) & 0x1FF);
-	if (!(e & 1)) return 0;
+	if (!StealthReadPte(cr3, (va >> 39) & 0x1FF, &e) || !(e & 1)) return 0;
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 30) & 0x1FF, &e) || !(e & 1)) return 0;
 	if (e & (1ULL << 7)) return (e & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
-	e = StealthCachedPte(&g_PtCache.Pd, e & STEALTH_CR3_PA_MASK, (va >> 21) & 0x1FF);
-	if (!(e & 1)) return 0;
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 21) & 0x1FF, &e) || !(e & 1)) return 0;
 	if (e & (1ULL << 7)) return (e & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
-	e = StealthCachedPte(&g_PtCache.Pt, e & STEALTH_CR3_PA_MASK, (va >> 12) & 0x1FF);
-	if (!(e & 1)) return 0;
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 12) & 0x1FF, &e) || !(e & 1)) return 0;
 	return (e & STEALTH_CR3_PA_MASK) | (va & 0xFFF);
 }
 
-/* 带 KVAS 回退的翻译 */
+/* [FIX-v21] 彻底移除 KVAS 回退 — AMD 上 UserDirectoryTableBase(+0x280) 经常无效 */
 static UINT64 StealthTranslateVa(UINT64 pid, UINT64 cr3, UINT64 va)
 {
-	UINT64 pa = StealthTranslateVaInternal(cr3, va);
-	if (pa) return pa;
-	/* 用户空间地址翻译失败 → 尝试 UserDirectoryTableBase (KVAS) */
-	if (va < 0x800000000000ULL) {
-		UINT64 ucr3 = StealthGetUserCr3(pid);
-		if (ucr3 && ucr3 != cr3) {
-			StealthResetCache();
-			pa = StealthTranslateVaInternal(ucr3, va);
-			if (pa) {
-				/* 后续直接用 UserCr3 */
-				int i;
-				for (i = 0; i < STEALTH_CR3_CACHE_SIZE; i++)
-					if (g_Cr3Cache[i].Pid == pid) { g_Cr3Cache[i].Cr3 = ucr3; break; }
-				return pa;
-			}
-		}
-		StealthInvalidateCr3(pid);
-	}
-	return 0;
+	UNREFERENCED_PARAMETER(pid);
+	return StealthTranslateVaInternal(cr3, va);
 }
 
 /* ---- 进程内存读取 (物理直读 + attach 兜底) ----
@@ -272,22 +269,39 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 	StealthFailEntry failList[STEALTH_MAX_FAIL_ENTRIES];
 	ULONG failCount = 0;
 
+	/* [DIAG] 统计计数器 — 全局, 前 50 次 + 每 5000 次打印 */
+	static volatile LONG s_callCount = 0;
+	static volatile LONG s_physOk = 0;
+	static volatile LONG s_physFail = 0;
+	static volatile LONG s_fallbackOk = 0;
+	static volatile LONG s_fallbackFail = 0;
+	static volatile LONG s_fallbackExcept = 0;
+	static volatile LONG s_noProcFail = 0;
+
+	LONG callSeq = InterlockedIncrement(&s_callCount);
+	/* [FIX-v24] 增大阈值: 前5000次(覆盖First+Next两轮扫描) + 每5000次 */
+	BOOLEAN doLog = (callSeq <= 5000) || ((callSeq % 5000) == 0);
+	DbgPrint("[SvmDebug] [SDR] test StealthDirectRead pid=%llu\n", callSeq, pid);
 	if (!size || !outBuf) return FALSE;
 
-	/* [FIX] 每次读取前重置页表缓存 + CR3 缓存
-	 * 问题: StealthTranslateVa 的 KVAS 回退会把 g_Cr3Cache 中的 CR3
-	 *       替换为 UserDirectoryTableBase (+0x280), 在 AMD 上这通常是无效值。
-	 *       First Scan 期间替换了 → Next Scan 用错误 CR3 → 翻译全失败 → Found:0
-	 * 修复: 同时清除 g_PtCache 和当前 pid 的 CR3 缓存, 强制每次重新读取 */
-	StealthResetCache();
-	StealthInvalidateCr3(pid);
+	/* [FIX-v21] 单次 PsLookup + 直读 CR3, 不使用 g_Cr3Cache
+	 *   g_Cr3Cache 全局无锁 → 多线程竞争 → Pid/Cr3 配对错乱 → 翻译全错 */
+	if (!NT_SUCCESS(PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc)) || !proc) {
+		if (doLog) DbgPrint("[SvmDebug] [SDR] #%d FAIL: PsLookup failed pid=%llu\n", callSeq, pid);
+		return FALSE;
+	}
 
-	cr3 = StealthGetCr3(pid);
-	if (!cr3) return FALSE;
+	cr3 = *(PUINT64)((PUCHAR)proc + STEALTH_EPROCESS_DTB) & STEALTH_CR3_PA_MASK;
+	if (!cr3) {
+		if (doLog) DbgPrint("[SvmDebug] [SDR] #%d FAIL: CR3=0 pid=%llu\n", callSeq, pid);
+		ObDereferenceObject(proc);
+		return FALSE;
+	}
 
-	/* 获取 PEPROCESS 供 attach fallback 使用 */
-	if (!NT_SUCCESS(PsLookupProcessByProcessId((PVOID)(UINT_PTR)pid, &proc)) || !proc)
-		proc = NULL;
+	if (doLog) {
+		DbgPrint("[SvmDebug] [SDR] #%d ENTER: pid=%llu addr=0x%llX size=%u cr3=0x%llX\n",
+			callSeq, pid, addr, size, cr3);
+	}
 
 	/* === Pass 1: 逐页物理直读, 记录失败页 === */
 	dst = (PUCHAR)outBuf; va = addr; done = 0;
@@ -299,11 +313,13 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 		BOOLEAN ok = FALSE;
 
 		pa = StealthTranslateVa(pid, cr3, va);
-		if (pa && StealthReadPhysical(pa, dst + done, chunk))
+		if (pa && StealthReadPhysical(pa, dst + done, chunk)) {
 			ok = TRUE;
+			InterlockedIncrement(&s_physOk);
+		}
 
 		if (!ok) {
-			/* 记录失败页, 稍后批量 attach 处理 */
+			InterlockedIncrement(&s_physFail);
 			if (failCount < STEALTH_MAX_FAIL_ENTRIES) {
 				failList[failCount].Offset = done;
 				failList[failCount].Va = va;
@@ -311,7 +327,6 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 				failCount++;
 			}
 			else {
-				/* failList 满, 填零 */
 				RtlZeroMemory(dst + done, chunk);
 			}
 		}
@@ -320,33 +335,42 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 		}
 
 		done += chunk; va += chunk;
-		cr3 = StealthGetCr3(pid);
-		if (!cr3) break;
+		/* [FIX-v21] 不再循环内重读 CR3 */
 	}
 
-	/* === Pass 2: 一次 attach, 批量读取所有 paged-out 页 === */
-	if (failCount > 0 && proc) {
-		KAPC_STATE apc;
-		UCHAR tmpBuf[0x1000];
+	/* === Pass 2: MmCopyVirtualMemory 读取 paged-out 页 ===
+	 *
+	 * [FIX-v21] 不再使用 KeStackAttachProcess (被 NPT Hook slot 22 拦截!)
+	 *   旧代码 attach 后地址空间可能未切换 → 读到错误数据
+	 *
+	 * MmCopyVirtualMemory 直接用 EPROCESS 指针跨进程拷贝:
+	 *   - 已导出, 链接无问题
+	 *   - 内部自行处理 attach/缺页, 不经过我们被 Hook 的 KeStackAttachProcess
+	 *   - 不需要句柄, 直接用已有的 proc (EPROCESS)
+	 */
+	if (failCount > 0) {
 		ULONG i;
-
-		KeStackAttachProcess(proc, &apc);
+		PEPROCESS curProc = PsGetCurrentProcess();
 
 		for (i = 0; i < failCount; i++) {
-			__try {
-				ULONG c = failList[i].Chunk;
-				if (c > 0x1000) c = 0x1000;
-				RtlCopyMemory(tmpBuf, (PVOID)(ULONG_PTR)failList[i].Va, c);
-				RtlCopyMemory(dst + failList[i].Offset, tmpBuf, c);
+			SIZE_T bytesRead = 0;
+			ULONG c = failList[i].Chunk;
+			if (c > 0x1000) c = 0x1000;
+
+			NTSTATUS st = MmCopyVirtualMemory(
+				proc, (PVOID)(ULONG_PTR)failList[i].Va,
+				curProc, dst + failList[i].Offset,
+				(SIZE_T)c, KernelMode, &bytesRead);
+
+			if (NT_SUCCESS(st) && bytesRead > 0) {
 				anyRead = TRUE;
-				failList[i].Chunk = 0; /* 标记成功 */
+				failList[i].Chunk = 0;
+				InterlockedIncrement(&s_fallbackOk);
 			}
-			__except (1) {
-				/* 此页仍然失败, 保留非零 Chunk 供后续填零 */
+			else {
+				InterlockedIncrement(&s_fallbackFail);
 			}
 		}
-
-		KeUnstackDetachProcess(&apc);
 	}
 
 	/* === 仍然失败的页填零 === */
@@ -358,7 +382,18 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 		}
 	}
 
-	if (proc) ObDereferenceObject(proc);
+	/* [DIAG] 日志输出 */
+	if (doLog) {
+		ULONG firstBytes = 0;
+		if (size >= 4) firstBytes = *(PULONG)outBuf;
+		DbgPrint("[SvmDebug] [SDR] #%d EXIT: anyRead=%d failCount=%u first4B=0x%08X "
+			"[totals: physOk=%d physFail=%d fbOk=%d fbFail=%d fbExcept=%d]\n",
+			callSeq, (int)anyRead, failCount, firstBytes,
+			(int)s_physOk, (int)s_physFail,
+			(int)s_fallbackOk, (int)s_fallbackFail, (int)s_fallbackExcept);
+	}
+
+	ObDereferenceObject(proc);
 	return anyRead;
 }
 
@@ -426,20 +461,28 @@ static DWORD StealthGetPageProtect(UINT64 cr3, UINT64 va, PUINT64 skip)
 {
 	UINT64 e;
 	if (skip) *skip = 0x1000;
-	if (g_PtCache.Cr3 != cr3) { StealthResetCache(); g_PtCache.Cr3 = cr3; }
 
-	e = StealthCachedPte(&g_PtCache.Pml4, cr3 & ~0xFFFULL, (va >> 39) & 0x1FF);
-	if (!(e & 1)) { if (skip) *skip = (((va >> 39) + 1) << 39) - va; return 0; }
+	if (!StealthReadPte(cr3, (va >> 39) & 0x1FF, &e) || !(e & 1))
+	{
+		if (skip) *skip = (((va >> 39) + 1) << 39) - va; return 0;
+	}
 
-	e = StealthCachedPte(&g_PtCache.Pdpt, e & STEALTH_CR3_PA_MASK, (va >> 30) & 0x1FF);
-	if (!(e & 1)) { if (skip) *skip = (((va >> 30) + 1) << 30) - va; return 0; }
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 30) & 0x1FF, &e) || !(e & 1))
+	{
+		if (skip) *skip = (((va >> 30) + 1) << 30) - va; return 0;
+	}
 	if (e & (1ULL << 7)) { if (skip) *skip = 1ULL << 30; return StealthPteToProtect(e); }
 
-	e = StealthCachedPte(&g_PtCache.Pd, e & STEALTH_CR3_PA_MASK, (va >> 21) & 0x1FF);
-	if (!(e & 1)) { if (skip) *skip = (((va >> 21) + 1) << 21) - va; return 0; }
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 21) & 0x1FF, &e) || !(e & 1))
+	{
+		if (skip) *skip = (((va >> 21) + 1) << 21) - va; return 0;
+	}
 	if (e & (1ULL << 7)) { if (skip) *skip = 1ULL << 21; return StealthPteToProtect(e); }
 
-	e = StealthCachedPte(&g_PtCache.Pt, e & STEALTH_CR3_PA_MASK, (va >> 12) & 0x1FF);
+	if (!StealthReadPte(e & STEALTH_CR3_PA_MASK, (va >> 12) & 0x1FF, &e))
+	{
+		if (skip) *skip = 0x1000; return 0;
+	}
 	if (skip) *skip = 0x1000;
 	return StealthPteToProtect(e);
 }
@@ -1008,7 +1051,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 	case IOCTL_CE_READMEMORY:
 		/* [DIAG] 无条件打印 - 每次进入 IOCTL_CE_READMEMORY 都会输出 */
-		DbgPrint("[DIAG] IOCTL_CE_READMEMORY entry, SvmActive=%d\n",
+		DbgPrint("[SvmDebug] [DIAG] IOCTL_CE_READMEMORY entry, SvmActive=%d\n",
 			(int)SvmBridge_IsActive());
 
 		__try
@@ -1028,10 +1071,15 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 			{
 				LONG diagSeq = InterlockedIncrement(&s_readDiag);
-				if (diagSeq <= 20) {
-					DbgPrint("[SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
+				/* [FIX-v24] 前100次 + 每2000次 */
+				if (diagSeq <= 100 || (diagSeq % 2000) == 0) {
+					DbgPrint("[SvmDebug] [SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
 						diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
 						(int)SvmBridge_IsActive());
+				}
+				/* [DIAG-v24] 每1000次打印一次摘要, 确保 Next Scan 可见 */
+				if (diagSeq == 1 || (diagSeq % 1000) == 0) {
+					DbgPrint("[SvmDebug] [SVM-CE-SUM] Total IOCTL_CE_READMEMORY calls: %d\n", diagSeq);
 				}
 			}
 
@@ -1066,15 +1114,23 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 				if (StealthDirectRead(savedPid, savedAddr, pinp, savedSize))
 				{
-					SVM_TRACE_ONCE("READMEM", "<<< StealthDirectRead SUCCESS");
+					/* [DIAG-v24] 成功计数 */
+					static volatile LONG s_readOk = 0;
+					LONG okCnt = InterlockedIncrement(&s_readOk);
+					if (okCnt <= 50 || (okCnt % 1000) == 0) {
+						ULONG f4 = 0;
+						if (savedSize >= 4) { __try { f4 = *(PULONG)pinp; } __except (1) {} }
+						DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead OK #%d: PID=%llu addr=0x%llX size=%u f4=0x%08X\n",
+							okCnt, savedPid, savedAddr, (UINT)savedSize, f4);
+					}
 					ntStatus = STATUS_SUCCESS;
 				}
 				else
 				{
 					static volatile LONG s_readFail = 0;
 					LONG fCnt = InterlockedIncrement(&s_readFail);
-					if (fCnt <= 20 || (fCnt % 5000) == 0) {
-						DbgPrint("[SVM-CE] StealthDirectRead FAIL #%d: PID=%llu addr=0x%llX size=%u\n",
+					if (fCnt <= 100 || (fCnt % 2000) == 0) {
+						DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead FAIL #%d: PID=%llu addr=0x%llX size=%u\n",
 							fCnt, savedPid, savedAddr, (UINT)savedSize);
 					}
 					__try { RtlZeroMemory(pinp, savedSize); }
@@ -1086,7 +1142,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			{
 				LONG legCnt = InterlockedIncrement(&s_legacyCount);
 				if (legCnt <= 5 || (legCnt % 5000) == 0) {
-					DbgPrint("[SVM-CE] LEGACY READ (no SVM) #%d: PID=%llu addr=0x%llX size=%u\n",
+					DbgPrint("[SvmDebug] [SVM-CE] LEGACY READ (no SVM) #%d: PID=%llu addr=0x%llX size=%u\n",
 						legCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
 				}
 				ntStatus = ReadProcessMemory((DWORD)pinp->processid, NULL, (PVOID)(UINT_PTR)pinp->startaddress, pinp->bytestoread, pinp) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
@@ -1121,7 +1177,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				static volatile LONG s_writeDiag = 0;
 				LONG wCnt = InterlockedIncrement(&s_writeDiag);
 				if (wCnt <= 20 || (wCnt % 2000) == 0) {
-					DbgPrint("[SVM-CE] WRITE VMEXIT #%d: PID=%llu addr=0x%llX size=%u\n",
+					DbgPrint("[SvmDebug] [SVM-CE] WRITE VMEXIT #%d: PID=%llu addr=0x%llX size=%u\n",
 						wCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestowrite);
 				}
 				ntStatus = HvBridge_WriteProcessMemory(
@@ -1369,7 +1425,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					&qvmBase, &qvmSize, &qvmProt, &qvmState, &qvmType);
 
 				if (InterlockedIncrement(&s_qvmDiag) <= 30) {
-					DbgPrint("[QVM-DIAG] StealthQueryVM: PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X\n",
+					DbgPrint("[SvmDebug] [QVM-DIAG] StealthQueryVM: PID=%llu VA=0x%llX -> status=0x%X base=0x%llX size=0x%llX prot=0x%X state=0x%X\n",
 						PInputBuf->ProcessID, PInputBuf->StartAddress,
 						ntStatus, qvmBase, qvmSize, qvmProt, qvmState, qvmType);
 				}
@@ -1390,7 +1446,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				ntStatus = GetMemoryRegionData((DWORD)PInputBuf->ProcessID, NULL, (PVOID)(UINT_PTR)(PInputBuf->StartAddress), &(POutputBuf->protection), &length, &BaseAddress);
 
 				if (s_qvmDiag <= 5) {
-					DbgPrint("[QVM-DIAG] Fallback: PID=%llu VA=0x%llX -> status=0x%X prot=0x%X len=0x%llX base=0x%llX\n",
+					DbgPrint("[SvmDebug] [QVM-DIAG] Fallback: PID=%llu VA=0x%llX -> status=0x%X prot=0x%X len=0x%llX base=0x%llX\n",
 						PInputBuf->ProcessID, PInputBuf->StartAddress,
 						ntStatus, POutputBuf->protection, (UINT64)length, (UINT64)BaseAddress);
 				}
@@ -3420,6 +3476,16 @@ case IOCTL_CE_GETCPUIDS:
 
 	case IOCTL_CE_BATCH_READ:
 	{
+		/* [DIAG-v24] 批量读取计数, 确认 CE 是否走此路径 */
+		{
+			static volatile LONG s_batchCount = 0;
+			LONG bc = InterlockedIncrement(&s_batchCount);
+			if (bc <= 50 || (bc % 1000) == 0)
+				DbgPrint("[SvmDebug] [BATCH-READ] #%d: inLen=%u outLen=%u\n",
+					bc,
+					irpStack->Parameters.DeviceIoControl.InputBufferLength,
+					irpStack->Parameters.DeviceIoControl.OutputBufferLength);
+		}
 		ntStatus = HvBatchRead_Dispatch(
 			Irp->AssociatedIrp.SystemBuffer,
 			irpStack->Parameters.DeviceIoControl.InputBufferLength,
