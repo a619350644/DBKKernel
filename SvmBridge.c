@@ -372,10 +372,10 @@ NTSTATUS SvmBridge_QueryVirtualMemory(
 
     if (NT_SUCCESS(status)) {
         if (OutBaseAddress) *OutBaseAddress = resp.BaseAddress;
-        if (OutRegionSize)  *OutRegionSize  = resp.RegionSize;
-        if (OutProtection)  *OutProtection  = resp.Protection;
-        if (OutState)       *OutState       = resp.State;
-        if (OutType)        *OutType        = resp.Type;
+        if (OutRegionSize)  *OutRegionSize = resp.RegionSize;
+        if (OutProtection)  *OutProtection = resp.Protection;
+        if (OutState)       *OutState = resp.State;
+        if (OutType)        *OutType = resp.Type;
     }
 
     return status;
