@@ -279,9 +279,18 @@ static BOOLEAN StealthDirectRead(UINT64 pid, UINT64 addr, PVOID outBuf, ULONG si
 	static volatile LONG s_noProcFail = 0;
 
 	LONG callSeq = InterlockedIncrement(&s_callCount);
-	/* [FIX-v24] 增大阈值: 前5000次(覆盖First+Next两轮扫描) + 每5000次 */
 	BOOLEAN doLog = (callSeq <= 5000) || ((callSeq % 5000) == 0);
-	DbgPrint("[SvmDebug] [SDR] test StealthDirectRead pid=%llu\n", callSeq, pid);
+
+	/* [BP-4] StealthDirectRead 入口 — 计数+断点 */
+	{
+		static volatile LONG s_bp4 = 0;
+		LONG c = InterlockedIncrement(&s_bp4);
+		if (c <= 20 || (c % 100) == 0)
+			DbgPrint("[SvmDebug] >>> BP-4 #%d: StealthDirectRead pid=%llu addr=0x%llX sz=%u\n",
+				c, pid, addr, size);
+
+	}
+
 	if (!size || !outBuf) return FALSE;
 
 	/* [FIX-v21] 单次 PsLookup + 直读 CR3, 不使用 g_Cr3Cache
@@ -1050,110 +1059,115 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 	{
 
 	case IOCTL_CE_READMEMORY:
-		/* [DIAG] 无条件打印 - 每次进入 IOCTL_CE_READMEMORY 都会输出 */
-		DbgPrint("[SvmDebug] [DIAG] IOCTL_CE_READMEMORY entry, SvmActive=%d\n",
-			(int)SvmBridge_IsActive());
+		/* [BP-3] IOCTL_CE_READMEMORY 入口 — 计数+断点 */
+	{
+		static volatile LONG s_bp3 = 0;
+		LONG c = InterlockedIncrement(&s_bp3);
+		if (c <= 20 || (c % 100) == 0)
+			DbgPrint("[SvmDebug] >>> BP-3 #%d: IOCTL_CE_READMEMORY entry\n", c);
 
-		__try
+	}
+
+	__try
+	{
+		struct input
 		{
-			struct input
-			{
-				UINT64 processid;
-				UINT64 startaddress;
-				WORD bytestoread;
-			} *pinp;
-			static volatile LONG s_readDiag = 0;
-			static volatile LONG s_vmexitOkCount = 0;
-			static volatile LONG s_fallbackCount = 0;
-			static volatile LONG s_legacyCount = 0;
+			UINT64 processid;
+			UINT64 startaddress;
+			WORD bytestoread;
+		} *pinp;
+		static volatile LONG s_readDiag = 0;
+		static volatile LONG s_vmexitOkCount = 0;
+		static volatile LONG s_fallbackCount = 0;
+		static volatile LONG s_legacyCount = 0;
 
-			pinp = Irp->AssociatedIrp.SystemBuffer;
+		pinp = Irp->AssociatedIrp.SystemBuffer;
 
-			{
-				LONG diagSeq = InterlockedIncrement(&s_readDiag);
-				/* [FIX-v24] 前100次 + 每2000次 */
-				if (diagSeq <= 100 || (diagSeq % 2000) == 0) {
-					DbgPrint("[SvmDebug] [SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
-						diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
-						(int)SvmBridge_IsActive());
-				}
-				/* [DIAG-v24] 每1000次打印一次摘要, 确保 Next Scan 可见 */
-				if (diagSeq == 1 || (diagSeq % 1000) == 0) {
-					DbgPrint("[SvmDebug] [SVM-CE-SUM] Total IOCTL_CE_READMEMORY calls: %d\n", diagSeq);
-				}
+		{
+			LONG diagSeq = InterlockedIncrement(&s_readDiag);
+			/* [FIX-v24] 前100次 + 每2000次 */
+			if (diagSeq <= 100 || (diagSeq % 2000) == 0) {
+				DbgPrint("[SvmDebug] [SVM-CE] IOCTL_CE_READMEMORY #%d: PID=%llu addr=0x%llX size=%u SvmActive=%d\n",
+					diagSeq, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread,
+					(int)SvmBridge_IsActive());
 			}
+			/* [DIAG-v24] 每1000次打印一次摘要, 确保 Next Scan 可见 */
+			if (diagSeq == 1 || (diagSeq % 1000) == 0) {
+				DbgPrint("[SvmDebug] [SVM-CE-SUM] Total IOCTL_CE_READMEMORY calls: %d\n", diagSeq);
+			}
+		}
 
-			/* [v19] 所有内存读取强制走 VMEXIT 路径, 零 Guest R0 内存操作
-			 * HvBatchRead_SingleRead: 1次 CPUID VMEXIT → VMM Host 物理直读
-			 * 完全不在 Guest R0 留下任何 MmCopyMemory/KeStackAttachProcess 痕迹
+		/* [v19] 所有内存读取强制走 VMEXIT 路径, 零 Guest R0 内存操作
+		 * HvBatchRead_SingleRead: 1次 CPUID VMEXIT → VMM Host 物理直读
+		 * 完全不在 Guest R0 留下任何 MmCopyMemory/KeStackAttachProcess 痕迹
+		 *
+		 * 如果 VMEXIT 失败 (页面被换出/未映射), 填零而非回退到 Guest R0
+		 * 原因: KeStackAttachProcess/MmCopyMemory 会在 Guest R0 留下调用栈痕迹
+		 * 页面换出时 Memory Viewer 显示 00 是可接受的 (等同于未映射)
+		 */
+		if (SvmBridge_IsActive())
+		{
+			SVM_TRACE_ONCE("READMEM", ">>> Entering StealthDirectRead path (MmCopyMemory + attach fallback)");
+
+			/* [FIX] 使用 StealthDirectRead 替代 HvBatchRead_SingleRead
 			 *
-			 * 如果 VMEXIT 失败 (页面被换出/未映射), 填零而非回退到 Guest R0
-			 * 原因: KeStackAttachProcess/MmCopyMemory 会在 Guest R0 留下调用栈痕迹
-			 * 页面换出时 Memory Viewer 显示 00 是可接受的 (等同于未映射)
+			 * 为什么换掉 HvBatchRead (CPUID VMEXIT):
+			 *   HvBatchRead_SingleRead → CPUID(0x41414151) → VMM 物理直读
+			 *   但日志中从未出现过 [BatchRead] 前缀的打印
+			 *   → 要么 VMM 没有处理该 CPUID leaf, 要么 DoBatchRead 初始化失败
+			 *   → 读取全部返回零 → First Scan Found:0
+			 *
+			 * StealthDirectRead 的优势:
+			 *   1. MmCopyMemory(MM_COPY_MEMORY_PHYSICAL) 物理直读 — 不走任何 hook
+			 *   2. paged-out 页面自动 attach 兜底 — 不丢数据
+			 *   3. 已在 IOPLDispatcher.c 中实现并验证
 			 */
-			if (SvmBridge_IsActive())
+			UINT64 savedPid = pinp->processid;
+			UINT64 savedAddr = pinp->startaddress;
+			WORD   savedSize = pinp->bytestoread;
+
+			if (StealthDirectRead(savedPid, savedAddr, pinp, savedSize))
 			{
-				SVM_TRACE_ONCE("READMEM", ">>> Entering StealthDirectRead path (MmCopyMemory + attach fallback)");
-
-				/* [FIX] 使用 StealthDirectRead 替代 HvBatchRead_SingleRead
-				 *
-				 * 为什么换掉 HvBatchRead (CPUID VMEXIT):
-				 *   HvBatchRead_SingleRead → CPUID(0x41414151) → VMM 物理直读
-				 *   但日志中从未出现过 [BatchRead] 前缀的打印
-				 *   → 要么 VMM 没有处理该 CPUID leaf, 要么 DoBatchRead 初始化失败
-				 *   → 读取全部返回零 → First Scan Found:0
-				 *
-				 * StealthDirectRead 的优势:
-				 *   1. MmCopyMemory(MM_COPY_MEMORY_PHYSICAL) 物理直读 — 不走任何 hook
-				 *   2. paged-out 页面自动 attach 兜底 — 不丢数据
-				 *   3. 已在 IOPLDispatcher.c 中实现并验证
-				 */
-				UINT64 savedPid = pinp->processid;
-				UINT64 savedAddr = pinp->startaddress;
-				WORD   savedSize = pinp->bytestoread;
-
-				if (StealthDirectRead(savedPid, savedAddr, pinp, savedSize))
-				{
-					/* [DIAG-v24] 成功计数 */
-					static volatile LONG s_readOk = 0;
-					LONG okCnt = InterlockedIncrement(&s_readOk);
-					if (okCnt <= 50 || (okCnt % 1000) == 0) {
-						ULONG f4 = 0;
-						if (savedSize >= 4) { __try { f4 = *(PULONG)pinp; } __except (1) {} }
-						DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead OK #%d: PID=%llu addr=0x%llX size=%u f4=0x%08X\n",
-							okCnt, savedPid, savedAddr, (UINT)savedSize, f4);
-					}
-					ntStatus = STATUS_SUCCESS;
+				/* [DIAG-v24] 成功计数 */
+				static volatile LONG s_readOk = 0;
+				LONG okCnt = InterlockedIncrement(&s_readOk);
+				if (okCnt <= 50 || (okCnt % 1000) == 0) {
+					ULONG f4 = 0;
+					if (savedSize >= 4) { __try { f4 = *(PULONG)pinp; } __except (1) {} }
+					DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead OK #%d: PID=%llu addr=0x%llX size=%u f4=0x%08X\n",
+						okCnt, savedPid, savedAddr, (UINT)savedSize, f4);
 				}
-				else
-				{
-					static volatile LONG s_readFail = 0;
-					LONG fCnt = InterlockedIncrement(&s_readFail);
-					if (fCnt <= 100 || (fCnt % 2000) == 0) {
-						DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead FAIL #%d: PID=%llu addr=0x%llX size=%u\n",
-							fCnt, savedPid, savedAddr, (UINT)savedSize);
-					}
-					__try { RtlZeroMemory(pinp, savedSize); }
-					__except (1) {}
-					ntStatus = STATUS_SUCCESS;
-				}
+				ntStatus = STATUS_SUCCESS;
 			}
 			else
 			{
-				LONG legCnt = InterlockedIncrement(&s_legacyCount);
-				if (legCnt <= 5 || (legCnt % 5000) == 0) {
-					DbgPrint("[SvmDebug] [SVM-CE] LEGACY READ (no SVM) #%d: PID=%llu addr=0x%llX size=%u\n",
-						legCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+				static volatile LONG s_readFail = 0;
+				LONG fCnt = InterlockedIncrement(&s_readFail);
+				if (fCnt <= 100 || (fCnt % 2000) == 0) {
+					DbgPrint("[SvmDebug] [SVM-CE] StealthDirectRead FAIL #%d: PID=%llu addr=0x%llX size=%u\n",
+						fCnt, savedPid, savedAddr, (UINT)savedSize);
 				}
-				ntStatus = ReadProcessMemory((DWORD)pinp->processid, NULL, (PVOID)(UINT_PTR)pinp->startaddress, pinp->bytestoread, pinp) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+				__try { RtlZeroMemory(pinp, savedSize); }
+				__except (1) {}
+				ntStatus = STATUS_SUCCESS;
 			}
 		}
-		__except (1)
+		else
 		{
-			ntStatus = STATUS_UNSUCCESSFUL;
-		};
+			LONG legCnt = InterlockedIncrement(&s_legacyCount);
+			if (legCnt <= 5 || (legCnt % 5000) == 0) {
+				DbgPrint("[SvmDebug] [SVM-CE] LEGACY READ (no SVM) #%d: PID=%llu addr=0x%llX size=%u\n",
+					legCnt, pinp->processid, pinp->startaddress, (UINT)pinp->bytestoread);
+			}
+			ntStatus = ReadProcessMemory((DWORD)pinp->processid, NULL, (PVOID)(UINT_PTR)pinp->startaddress, pinp->bytestoread, pinp) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+		}
+	}
+	__except (1)
+	{
+		ntStatus = STATUS_UNSUCCESSFUL;
+	};
 
-		break;
+	break;
 
 
 	case IOCTL_CE_WRITEMEMORY:
@@ -1544,7 +1558,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		} *pinp;
 		pinp = Irp->AssociatedIrp.SystemBuffer;
 
-		DbgPrint("IOCTL_CE_READPHYSICALMEMORY:pinp->startaddress=%x, pinp->bytestoread=%d", pinp->startaddress, pinp->bytestoread);
+		/* [BP-6] 物理内存读取 — 计数+断点 */
+		{
+			static volatile LONG s_bp6 = 0;
+			LONG c = InterlockedIncrement(&s_bp6);
+
+		}
 
 
 		ntStatus = ReadPhysicalMemory((PVOID)(UINT_PTR)pinp->startaddress, (UINT_PTR)pinp->bytestoread, pinp);
@@ -1633,8 +1652,16 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		PHYSICAL_ADDRESS physical;
 		physical.QuadPart = 0;
 
-		ntStatus = STATUS_SUCCESS;
 		pinp = Irp->AssociatedIrp.SystemBuffer;
+
+		/* [BP-7] VA→PA 翻译 — 计数+断点 */
+		{
+			static volatile LONG s_bp7 = 0;
+			LONG c = InterlockedIncrement(&s_bp7);
+
+		}
+
+		ntStatus = STATUS_SUCCESS;
 
 		//DbgPrint("IOCTL_CE_GETPHYSICALADDRESS. ProcessID(%p)=%x BaseAddress(%p)=%x\n",&pinp->ProcessID, pinp->ProcessID, &pinp->BaseAddress, pinp->BaseAddress);
 
@@ -1769,6 +1796,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		UINT_PTR cr3reg = 0;
 		PEPROCESS selectedprocess;
 
+		/* [BP-8] GetCR3 — 计数+断点 */
+		{
+			static volatile LONG s_bp8 = 0;
+			LONG c = InterlockedIncrement(&s_bp8);
+
+		}
 
 		ntStatus = STATUS_SUCCESS;
 
@@ -2291,6 +2324,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 	case IOCTL_CE_MAP_MEMORY:
 	{
+		/* [BP-5] IOCTL_CE_MAP_MEMORY 入口 — 计数+断点 */
+		{
+			static volatile LONG s_bp5 = 0;
+			LONG c = InterlockedIncrement(&s_bp5);
+
+		}
 		struct input
 		{
 			UINT64 FromPID;
@@ -2312,14 +2351,14 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		inp = Irp->AssociatedIrp.SystemBuffer;
 		outp = Irp->AssociatedIrp.SystemBuffer;
 
-		DbgPrint("IOCTL_CE_MAP_MEMORY\n");
-		DbgPrint("address %x size %d\n", inp->address, inp->size);
+		DbgPrint("[SvmDebug] [MAP-MEM] IOCTL_CE_MAP_MEMORY entry\n");
+		DbgPrint("[SvmDebug] [MAP-MEM] addr=0x%llX size=%d fromPID=%llu toPID=%llu\n", inp->address, inp->size, inp->FromPID, inp->ToPID);
 		ntStatus = STATUS_UNSUCCESSFUL;
 
 		if (inp->FromPID)
 		{
 			//switch
-			DbgPrint("From PID %d\n", inp->FromPID);
+			DbgPrint("[SvmDebug] [MAP-MEM] From PID %llu\n", inp->FromPID);
 			if (PsLookupProcessByProcessId((PVOID)(UINT_PTR)(inp->FromPID), &selectedprocess) == STATUS_SUCCESS)
 			{
 				__try
@@ -2341,7 +2380,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				}
 				__except (1)
 				{
-					DbgPrint("Exception\n");
+					DbgPrint("[SvmDebug] [MAP-MEM] Exception!\n");
 					ntStatus = STATUS_UNSUCCESSFUL;
 					break;
 				}
@@ -2351,19 +2390,19 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 		}
 		else
 		{
-			DbgPrint("From kernel or self\n", inp->FromPID);
+			DbgPrint("[SvmDebug] [MAP-MEM] From kernel or self\n");
 			__try
 			{
 				FromMDL = IoAllocateMdl((PVOID)(UINT_PTR)inp->address, inp->size, FALSE, FALSE, NULL);
 				if (FromMDL)
 				{
-					DbgPrint("IoAllocateMdl success\n");
+					DbgPrint("[SvmDebug] [MAP-MEM] IoAllocateMdl success\n");
 					MmProbeAndLockPages(FromMDL, KernelMode, IoReadAccess);
 				}
 			}
 			__except (1)
 			{
-				DbgPrint("Exception\n");
+				DbgPrint("[SvmDebug] [MAP-MEM] Exception!\n");
 
 				if (FromMDL)
 				{
@@ -2375,12 +2414,12 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 		if (FromMDL)
 		{
-			DbgPrint("FromMDL is valid\n");
+			DbgPrint("[SvmDebug] [MAP-MEM] FromMDL is valid\n");
 
 			if (inp->ToPID)
 			{
 				//switch
-				DbgPrint("To PID %d\n", inp->ToPID);
+				DbgPrint("[SvmDebug] [MAP-MEM] To PID %llu\n", inp->ToPID);
 				if (PsLookupProcessByProcessId((PVOID)(UINT_PTR)(inp->ToPID), &selectedprocess) == STATUS_SUCCESS)
 				{
 					__try
@@ -2402,7 +2441,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 					}
 					__except (1)
 					{
-						DbgPrint("Exception part 2\n");
+						DbgPrint("[SvmDebug] [MAP-MEM] Exception part 2!\n");
 						ntStatus = STATUS_UNSUCCESSFUL;
 						break;
 					}
@@ -2412,7 +2451,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 			}
 			else
 			{
-				DbgPrint("To kernel or self\n", inp->FromPID);
+				DbgPrint("[SvmDebug] [MAP-MEM] To kernel or self\n");
 
 				__try
 				{
@@ -2422,7 +2461,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 				}
 				__except (1)
 				{
-					DbgPrint("Exception part 2\n");
+					DbgPrint("[SvmDebug] [MAP-MEM] Exception part 2!\n");
 				}
 			}
 
@@ -2432,7 +2471,7 @@ NTSTATUS DispatchIoctl(IN PDEVICE_OBJECT DeviceObject, IN PIRP Irp)
 
 		}
 		else
-			DbgPrint("FromMDL==NULL\n");
+			DbgPrint("[SvmDebug] [MAP-MEM] FAIL: FromMDL==NULL\n");
 
 
 

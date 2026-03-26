@@ -47,10 +47,7 @@ static NTSTATUS SvmBridge_OpenDevice(void)
         0,
         NULL, 0);
 
-    if (!NT_SUCCESS(status)) {
-        g_SvmDeviceHandle = NULL;
-        DbgPrint("[SvmBridge] Cannot open \\Device\\SvmDebug: 0x%X\n", status);
-    }
+
 
     return status;
 }
@@ -249,8 +246,7 @@ NTSTATUS SvmBridge_DetachTarget(ULONG64 targetPid)
 
     SvmBridge_UnsetDebuggedPid(targetPid);
 
-    DbgPrint("[SvmBridge] Target PID %llu: detached + undebugged, status=0x%X\n",
-        targetPid, status);
+
 
     return status;
 }
@@ -311,12 +307,7 @@ NTSTATUS SvmBridge_SetDebuggedPid(ULONG64 targetPid)
         &info, sizeof(info),
         NULL, 0);
 
-    if (NT_SUCCESS(status)) {
-        DbgPrint("[SvmBridge] PID %llu marked as debugged\n", targetPid);
-    }
-    else {
-        DbgPrint("[SvmBridge] Set debugged PID %llu failed: 0x%X\n", targetPid, status);
-    }
+
 
     return status;
 }
@@ -335,12 +326,6 @@ NTSTATUS SvmBridge_UnsetDebuggedPid(ULONG64 targetPid)
         &info, sizeof(info),
         NULL, 0);
 
-    if (NT_SUCCESS(status)) {
-        DbgPrint("[SvmBridge] PID %llu unmarked as debugged\n", targetPid);
-    }
-    else {
-        DbgPrint("[SvmBridge] Unset debugged PID %llu failed: 0x%X\n", targetPid, status);
-    }
 
     return status;
 }
