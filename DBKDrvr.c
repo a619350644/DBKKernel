@@ -359,7 +359,7 @@ NTSTATUS DriverEntry(IN PDRIVER_OBJECT DriverObject,
 	DriverObject->DriverUnload = UnloadDriver;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchClose;
-
+	
 	if (loadedbydbvm)
 		DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = (PDRIVER_DISPATCH)DispatchIoctlDBVM;
 	else
